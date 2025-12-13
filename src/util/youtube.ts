@@ -8,12 +8,10 @@ import {
 	YTString,
 } from './types';
 
-// 2025: Define headers directly here to ensure they are modern
-const youtubeHeaders = {
-	'User-Agent':
-		'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+// We define the headers here so we can share them exactly
+export const COMMON_HEADERS = {
+	'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 	'Accept-Language': 'en-US,en;q=0.9',
-	'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+417;',
 };
 
 export type VideoData = {
@@ -33,9 +31,7 @@ export async function getVideoData(
 	
 	for (const url of urls) {
 		try {
-			response = await fetch(url, {
-				headers: youtubeHeaders,
-			});
+			response = await fetch(url, { headers: COMMON_HEADERS });
 			if (response.ok) break;
 		} catch (e) {
 			console.error(`Failed to fetch ${url}`, e);
@@ -46,37 +42,34 @@ export async function getVideoData(
 		return err(['Stream not found', 404]);
 	
 	if (!response.ok)
-		return err([
-			'Failed to fetch stream: ' + response.statusText,
-			response.status,
-		]);
+		return err(['Failed to fetch stream: ' + response.statusText, response.status]);
 
 	const text = await response.text();
 
-	// 2025 Robust Regex: Handles various YouTube formatting quirks (spacing, quotes, window object)
+	// --- IMPROVED REGEX ---
+	// Captures ytInitialData handling various spacing/quote styles
 	const initialData = getMatch(
 		text,
 		/(?:var\s+ytInitialData|window\[['"]ytInitialData['"]\])\s*=\s*({[\s\S]+?});/
 	);
 	
 	if (initialData.isErr()) {
-		// Try fallback for "PRELOADED" data which sometimes appears instead
-		const fallback = getMatch(
-			text,
-			/ytInitialData\s*=\s*({[\s\S]+?});/
-		);
+		// Fallback for "PRELOADED" data
+		const fallback = getMatch(text, /ytInitialData\s*=\s*({[\s\S]+?});/);
 		if (fallback.isErr()) return initialData;
 	}
 
-	// 2025 Robust Regex: Handles ytcfg.set({ ... })
+	// Captures ytcfg.set({ ... }) handling newlines and messy json
 	const config = getMatch<YTConfig>(text, /ytcfg\.set\s*\(\s*({[\s\S]+?})\s*\)\s*;/);
 	
 	if (config.isErr()) return config;
 
-	if (!config.value.INNERTUBE_API_KEY || !config.value.INNERTUBE_CONTEXT) {
-		// Sometimes context is buried deeper or spread out. 
-		// For now, if we miss this, we can't authenticate the chat request.
-		return err(['Failed to load YouTube context keys', 500]);
+	// Validation: Ensure we actually got the keys we need
+	if (!config.value.INNERTUBE_API_KEY) {
+		return err(['Scraper failed: Missing API Key', 500]);
+	}
+	if (!config.value.INNERTUBE_CONTEXT) {
+		return err(['Scraper failed: Missing Context', 500]);
 	}
 
 	return ok({ initialData: initialData.value, config: config.value });
