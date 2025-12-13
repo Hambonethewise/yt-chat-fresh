@@ -8,11 +8,10 @@ import {
 	YTString,
 } from './types';
 
-// Shared headers to ensure we look like the same browser during scrape & fetch
+// Standard headers for scraping
 export const COMMON_HEADERS = {
 	'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 	'Accept-Language': 'en-US,en;q=0.9',
-	'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+417;',
 };
 
 export type VideoData = {
@@ -30,10 +29,8 @@ export async function getVideoData(
 ): Promise<Ok<VideoData, unknown> | Err<unknown, [string, number]>> {
 	let response: Response | undefined;
 	
-	// 1. Try to fetch the video page
 	for (const url of urls) {
 		try {
-			console.log(`[SCRAPER] Fetching ${url}...`);
 			response = await fetch(url, { headers: COMMON_HEADERS });
 			if (response.ok) break;
 		} catch (e) {
@@ -48,58 +45,37 @@ export async function getVideoData(
 		return err(['Failed to fetch stream: ' + response.statusText, response.status]);
 
 	const text = await response.text();
-	console.log(`[SCRAPER] Page fetched. Length: ${text.length}`);
 
-	// 2. PARSE INITIAL DATA (The video info)
-	// We look for the variable, handling various spacing/quote styles
+	// 1. Get Initial Data (Video Info)
 	const initialData = getMatch(
 		text,
 		/(?:var\s+ytInitialData|window\[['"]ytInitialData['"]\])\s*=\s*({[\s\S]+?});/
 	);
 	
 	if (initialData.isErr()) {
-		console.log("[SCRAPER] Failed to find standard ytInitialData, trying fallback...");
 		const fallback = getMatch(text, /ytInitialData\s*=\s*({[\s\S]+?});/);
-		if (fallback.isErr()) return initialData; // Propagate error if both fail
+		if (fallback.isErr()) return initialData;
 	}
 
-	// 3. THE MAGNET: Find ALL ytcfg.set(...) blocks and merge them
-	// YouTube splits config across multiple calls. We need ALL of them.
-	const configRegex = /ytcfg\.set\s*\(\s*({[\s\S]+?})\s*\)\s*;/g;
-	let configMatch;
-	let mergedConfig: any = {};
-
-	while ((configMatch = configRegex.exec(text)) !== null) {
-		try {
-			const part = JSON.parse(configMatch[1]);
-			mergedConfig = { ...mergedConfig, ...part };
-		} catch (e) {
-			// Ignore malformed JSON parts
-		}
-	}
-
-	// 4. Validate the merged config
-	if (!mergedConfig.INNERTUBE_API_KEY) {
-		return err(['Scraper failed: Could not find INNERTUBE_API_KEY in merged config', 500]);
-	}
+	// 2. Get Config (API Key & Context)
+	// We use a simpler regex that looks for the object containing the API key directly.
+	const config = getMatch<YTConfig>(
+		text,
+		/ytcfg\.set\s*\(\s*({[\s\S]+?INNERTUBE_API_KEY[\s\S]+?})\s*\)\s*;/
+	);
 	
-	// If context is missing, we can try to patch it, but usually the merge fixes it.
-	if (!mergedConfig.INNERTUBE_CONTEXT) {
-		console.log("[SCRAPER WARNING] INNERTUBE_CONTEXT missing. Attempting default...");
-		mergedConfig.INNERTUBE_CONTEXT = {
-			client: {
-				hl: "en",
-				gl: "US",
-				clientName: "WEB",
-				clientVersion: "2.20230920.00.00",
-				userAgent: COMMON_HEADERS['User-Agent'],
-				osName: "Windows",
-				osVersion: "10.0",
-			}
-		};
+	if (config.isErr()) {
+		// Fallback: Try finding any ytcfg.set block
+		const fallbackConfig = getMatch<YTConfig>(text, /ytcfg\.set\s*\(\s*({[\s\S]+?})\s*\)\s*;/);
+		if (fallbackConfig.isErr()) return config;
+		// Check if fallback has the key
+		if (!fallbackConfig.value.INNERTUBE_API_KEY) {
+			return err(['Scraper found config but missing API Key', 500]);
+		}
+		return ok({ initialData: initialData.value, config: fallbackConfig.value });
 	}
 
-	return ok({ initialData: initialData.value, config: mergedConfig });
+	return ok({ initialData: initialData.value, config: config.value });
 }
 
 function getMatch<T extends Json = Json>(
