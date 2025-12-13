@@ -3,12 +3,10 @@ import { getChannel } from './routes/channel';
 import { getStream } from './routes/stream';
 import { HandlerResult } from '@util/types';
 import { notFound } from '@util/util';
-export { YoutubeChat } from './YoutubeChat';
+export { YoutubeChatV2 } from './YoutubeChat'; // <--- UPDATED IMPORT
 
 export interface Env {
 	YOUTUBE_CHAT: DurableObjectNamespace;
-
-	// Variables
 	TRUFFLE_API_BASE: string;
 }
 
