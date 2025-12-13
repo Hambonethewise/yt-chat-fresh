@@ -47,7 +47,7 @@ export async function createChatObject(
 	return object.fetch('http://youtube.chat/ws' + url.search, req);
 }
 
-const chatInterval = 2000; // Slow down slightly for debugging
+const chatInterval = 1000;
 
 export class YoutubeChatV3 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
@@ -64,7 +64,6 @@ export class YoutubeChatV3 implements DurableObject {
 		r.all('*', () => new Response('Not found', { status: 404 }));
 	}
 
-	// NEW: Helper to send text logs directly to your screen
 	private logToClient(message: string) {
 		const payload = JSON.stringify({ debug: true, message: message });
 		for (const adapter of this.adapters.values()) {
@@ -138,21 +137,30 @@ export class YoutubeChatV3 implements DurableObject {
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
 		try {
-			this.logToClient(`[FETCH] Calling YouTube with token ending in ...${continuationToken.slice(-10)}`);
+			this.logToClient(`[FETCH] Using token: ...${continuationToken.slice(-8)}`);
 			
 			const headers = {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-				'Accept': '*/*',
-				'Accept-Language': 'en-US,en;q=0.9',
 				'Content-Type': 'application/json',
-				'Origin': 'https://www.youtube.com',
-				'Referer': 'https://www.youtube.com/'
 			};
 
+			// --- THE FIX: Clean Context ---
+			// Instead of sending the messy scraped context, we send a pristine one.
+			// This matches a standard "Logged Out Web Browser" request.
 			const payload = {
-				context: this.config.INNERTUBE_CONTEXT,
-				continuation: continuationToken,
-				currentPlayerState: { playerOffsetMs: "0" }
+				context: {
+					client: {
+						clientName: "WEB",
+						clientVersion: "2.20230920.00.00", // A known safe version
+						hl: "en",
+						gl: "US",
+						userAgent: headers['User-Agent'],
+						osName: "Windows",
+						osVersion: "10.0",
+						platform: "DESKTOP"
+					}
+				},
+				continuation: continuationToken
 			};
 
 			const res = await fetch(
@@ -160,16 +168,16 @@ export class YoutubeChatV3 implements DurableObject {
 				{ method: 'POST', headers: headers, body: JSON.stringify(payload) }
 			);
 
-			this.logToClient(`[FETCH] Status: ${res.status} ${res.statusText}`);
-
 			if (!res.ok) {
+				// If this fails, we will see exactly why in the debug log
 				const txt = await res.text();
-				this.logToClient(`[FETCH ERROR] Body: ${txt.slice(0, 100)}`);
+				this.logToClient(`[FETCH ERROR] ${res.status}: ${txt.slice(0, 150)}`);
 				throw new Error(`YouTube API Error: ${res.status}`);
+			} else {
+				this.logToClient(`[FETCH SUCCESS] Status: 200 OK`);
 			}
 
 			const data = await res.json<any>();
-			this.logToClient(`[DATA] Keys received: ${Object.keys(data).join(", ")}`);
 			
 			let actions: any[] = [];
 			
@@ -178,9 +186,8 @@ export class YoutubeChatV3 implements DurableObject {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
 			}
 			
-			// Box B (Lofi Girl often uses this)
+			// Box B
 			if (data.onResponseReceivedEndpoints) {
-				this.logToClient(`[PARSER] Found 'onResponseReceivedEndpoints' (Length: ${data.onResponseReceivedEndpoints.length})`);
 				for (const endpoint of data.onResponseReceivedEndpoints) {
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
 					if (endpointActions) {
@@ -198,11 +205,6 @@ export class YoutubeChatV3 implements DurableObject {
 			let nextContinuation = data.continuationContents?.liveChatContinuation?.continuations?.[0];
 			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
 				 nextContinuation = data.continuationContents.liveChatContinuation.continuations?.[0];
-			}
-			// Lofi Girl Token fallback
-			if (!nextContinuation && data.onResponseReceivedEndpoints) {
-				// Sometimes the token is inside the "timedContinuationData" of the last action
-				// We won't implement complex parsing yet, just seeing the logs will save us.
 			}
 
 			nextToken = (nextContinuation ? getContinuationToken(nextContinuation) : undefined) ?? continuationToken;
@@ -268,7 +270,7 @@ export class YoutubeChatV3 implements DurableObject {
 		
 		ws.send(JSON.stringify({
 			debug: true,
-			message: "DEBUG: Connected! I will now stream logs here..."
+			message: "DEBUG: Connected! Attempting to fetch with CLEAN context..."
 		}));
 
 		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
