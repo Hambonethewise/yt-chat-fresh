@@ -12,3 +12,6 @@ bindings = [{ name = "YOUTUBE_CHAT", class_name = "YoutubeChat" }]
 [[migrations]]
 tag = "v1"
 new_classes = ["YoutubeChat"]
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["YoutubeChat"]
