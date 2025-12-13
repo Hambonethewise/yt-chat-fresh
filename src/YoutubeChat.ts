@@ -39,7 +39,7 @@ export async function createChatObject(
 	return object.fetch('http://youtube.chat/ws' + url.search, req);
 }
 
-// Default speed. We will slow this down if errors occur.
+// Start with standard speed
 const BASE_CHAT_INTERVAL = 1000;
 
 export class YoutubeChatV3 implements DurableObject {
@@ -61,7 +61,7 @@ export class YoutubeChatV3 implements DurableObject {
 
 	private broadcast(data: any) {
 		for (const adapter of this.adapters.values()) {
-			// Debug block - comment out to silence logs
+			// Debug block
 			if (data.debug) {
 				for (const socket of adapter.sockets) {
 					try { socket.send(JSON.stringify(data)); } catch (e) {}
@@ -86,7 +86,7 @@ export class YoutubeChatV3 implements DurableObject {
 			
 			this.apiKey = data.apiKey;
 			this.clientVersion = data.clientVersion;
-			this.visitorData = data.visitorData; // Store the visitor data
+			this.visitorData = data.visitorData; 
 			this.initialData = data.initialData;
 			
 			this.channelId = traverseJSON(this.initialData, (value, key) => {
@@ -126,8 +126,7 @@ export class YoutubeChatV3 implements DurableObject {
 		let currentInterval = BASE_CHAT_INTERVAL;
 
 		try {
-			// --- HYBRID PAYLOAD ---
-			// Popout Strategy + Visitor Data = High Compatibility
+			// HYBRID PAYLOAD (This worked for "Yo wsp")
 			const payload = {
 				context: {
 					client: {
@@ -135,7 +134,7 @@ export class YoutubeChatV3 implements DurableObject {
 						clientVersion: this.clientVersion,
 						hl: "en",
 						gl: "US",
-						visitorData: this.visitorData, // <--- Added back for better auth
+						visitorData: this.visitorData, 
 						userAgent: COMMON_HEADERS['User-Agent'],
 						osName: "Windows",
 						osVersion: "10.0",
@@ -148,17 +147,23 @@ export class YoutubeChatV3 implements DurableObject {
 
 			const res = await fetch(
 				`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${this.apiKey}`,
-				{ method: 'POST', headers: COMMON_HEADERS, body: JSON.stringify(payload) }
+				{ 
+					method: 'POST', 
+					headers: COMMON_HEADERS, 
+					body: JSON.stringify(payload),
+					// CRITICAL FIX: Stop the worker from chasing redirects into a crash loop
+					redirect: 'manual' 
+				}
 			);
 
 			if (!res.ok) {
-				const txt = await res.text();
+				// If we get a 302/303 (Redirect), it's treated as an error here because of 'manual'
+				// This stops the recursion crash.
 				this.broadcast({ 
 					debug: true, 
-					message: `[API ERROR] ${res.status}. Retrying in 5s...` 
+					message: `[API STATUS] ${res.status}. Retrying in 5s...` 
 				});
-				// CRASH PREVENTION: Slow down if we hit an error
-				currentInterval = 5000; 
+				currentInterval = 5000; // Slow down
 				throw new Error(`YouTube API Error: ${res.status}`);
 			}
 
@@ -192,8 +197,10 @@ export class YoutubeChatV3 implements DurableObject {
 				this.broadcast(action);
 			}
 		} catch (e: any) {
-			this.broadcast({ debug: true, message: `[WARN] Loop error: ${e.message}` });
-			currentInterval = 5000; // Slow down on any crash
+			// Catch error, announce it, but DO NOT CRASH.
+			// Just wait 5 seconds and try again.
+			// this.broadcast({ debug: true, message: `[WARN] ${e.message}` });
+			currentInterval = 5000;
 		} finally {
 			this.nextContinuationToken = nextToken;
 			if (this.adapters.size > 0)
@@ -234,7 +241,7 @@ export class YoutubeChatV3 implements DurableObject {
 		const adapter = this.makeAdapter(adapterType);
 		adapter.sockets.add(ws);
 		
-		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected (Hybrid Strategy)" }));
+		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected (Stabilized Hybrid)" }));
 		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
 
 		ws.addEventListener('close', () => {
