@@ -15,15 +15,27 @@ export type VideoData = {
 };
 
 export async function getVideoData(
-	ids: string[]
+	inputs: string[]
 ): Promise<Ok<VideoData, unknown> | Err<unknown, [string, number]>> {
 	let response: Response | undefined;
 	
-	for (const id of ids) {
-		// --- THE PIVOT: FORCE POPOUT URL ---
-		// We ignore the standard watch link and go straight for the chat window.
-		// Popout URL: https://www.youtube.com/live_chat?is_popout=1&v=ID
-		const url = `https://www.youtube.com/live_chat?is_popout=1&v=${id}`;
+	for (const input of inputs) {
+		// --- CRASH PROOFING ---
+		// We extract the ID whether the input is a URL or a raw ID
+		let videoId = input;
+		try {
+			// If it looks like a URL, try to parse it
+			if (input.includes('youtube.com') || input.includes('youtu.be')) {
+				const urlObj = new URL(input);
+				videoId = urlObj.searchParams.get('v') || input;
+			}
+		} catch (e) {
+			// If it fails to parse as URL, assume it is already an ID
+			videoId = input;
+		}
+
+		// Now force the Popout URL which is safer for scraping
+		const url = `https://www.youtube.com/live_chat?is_popout=1&v=${videoId}`;
 		
 		try {
 			response = await fetch(url, { headers: COMMON_HEADERS });
@@ -53,7 +65,7 @@ export async function getVideoData(
 	const visitorMatch = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(text);
 	const visitorData = visitorMatch ? visitorMatch[1] : "";
 
-	// 2. INITIAL DATA (Popout structure often uses window["ytInitialData"])
+	// 2. INITIAL DATA (Popout structure)
 	let initialData = getMatch(text, /window\["ytInitialData"\]\s*=\s*({[\s\S]+?});/);
 	if (initialData.isErr()) {
 		// Fallback for standard structure
