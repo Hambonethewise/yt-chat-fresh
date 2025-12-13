@@ -64,6 +64,7 @@ export class YoutubeChatV3 implements DurableObject {
 		r.all('*', () => new Response('Not found', { status: 404 }));
 	}
 
+	// Helper to send logs to the client
 	private logToClient(message: string) {
 		const payload = JSON.stringify({ debug: true, message: message });
 		for (const adapter of this.adapters.values()) {
@@ -137,30 +138,23 @@ export class YoutubeChatV3 implements DurableObject {
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
 		try {
-			this.logToClient(`[FETCH] Using token: ...${continuationToken.slice(-8)}`);
-			
+			// LOGGING: Let's see if the config is actually loaded
+			if (!this.config?.INNERTUBE_CONTEXT) {
+				this.logToClient("[ERROR] INNERTUBE_CONTEXT is missing! The scraper might have failed.");
+				return;
+			}
+
 			const headers = {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 				'Content-Type': 'application/json',
 			};
 
-			// --- THE FIX: Clean Context ---
-			// Instead of sending the messy scraped context, we send a pristine one.
-			// This matches a standard "Logged Out Web Browser" request.
+			// We revert to the SCRAPED context, but we add the critical "isDocumentHidden" flag.
 			const payload = {
-				context: {
-					client: {
-						clientName: "WEB",
-						clientVersion: "2.20230920.00.00", // A known safe version
-						hl: "en",
-						gl: "US",
-						userAgent: headers['User-Agent'],
-						osName: "Windows",
-						osVersion: "10.0",
-						platform: "DESKTOP"
-					}
-				},
-				continuation: continuationToken
+				context: this.config.INNERTUBE_CONTEXT,
+				continuation: continuationToken,
+				currentPlayerState: { playerOffsetMs: "0" },
+				webClientInfo: { isDocumentHidden: false } // <--- THE MISSING KEY?
 			};
 
 			const res = await fetch(
@@ -169,24 +163,32 @@ export class YoutubeChatV3 implements DurableObject {
 			);
 
 			if (!res.ok) {
-				// If this fails, we will see exactly why in the debug log
 				const txt = await res.text();
-				this.logToClient(`[FETCH ERROR] ${res.status}: ${txt.slice(0, 150)}`);
+				this.logToClient(`[FETCH ERROR] ${res.status}: ${txt.slice(0, 100)}`);
 				throw new Error(`YouTube API Error: ${res.status}`);
 			} else {
-				this.logToClient(`[FETCH SUCCESS] Status: 200 OK`);
+				// If 200 OK, we are good.
 			}
 
 			const data = await res.json<any>();
 			
+			// LOGGING: Tell us what keys we got, so we know where the data is.
+			// this.logToClient(`[DATA KEYS] ${Object.keys(data).join(", ")}`);
+			
 			let actions: any[] = [];
 			
-			// Box A
+			// Strategy A: Standard
 			if (data.continuationContents?.liveChatContinuation?.actions) {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
 			}
 			
-			// Box B
+			// Strategy B: Framework Updates (New)
+			if (data.frameworkUpdates?.entityBatchUpdate?.mutations) {
+				// this.logToClient(`[PARSER] Found ${data.frameworkUpdates.entityBatchUpdate.mutations.length} mutations`);
+				// Note: Real chat actions usually aren't here, but status updates are.
+			}
+
+			// Strategy C: Response Endpoints (Lofi Girl)
 			if (data.onResponseReceivedEndpoints) {
 				for (const endpoint of data.onResponseReceivedEndpoints) {
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
@@ -200,7 +202,9 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			}
 
-			this.logToClient(`[SUMMARY] Found ${actions.length} chat actions.`);
+			if (actions.length > 0) {
+				this.logToClient(`[SUCCESS] Found ${actions.length} chat messages!`);
+			}
 
 			let nextContinuation = data.continuationContents?.liveChatContinuation?.continuations?.[0];
 			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
@@ -270,7 +274,7 @@ export class YoutubeChatV3 implements DurableObject {
 		
 		ws.send(JSON.stringify({
 			debug: true,
-			message: "DEBUG: Connected! Attempting to fetch with CLEAN context..."
+			message: "DEBUG: Connected! Using SCRAPED context with isDocumentHidden:false"
 		}));
 
 		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
