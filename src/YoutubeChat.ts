@@ -117,15 +117,29 @@ export class YoutubeChatV3 implements DurableObject {
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
 		try {
-			// LOG THE CONTEXT TO VERIFY IT'S NOT GARBAGE
-			const context = this.config.INNERTUBE_CONTEXT as any;
-			// this.logToClient(`[DEBUG] Client: ${context?.client?.clientName} v${context?.client?.clientVersion}`);
+			// --- THE SANITIZER ---
+			// We strip out everything except the 'client' object.
+			// This removes "clickTracking", "adSignals", and other junk that causes 400 Errors.
+			const originalContext = this.config.INNERTUBE_CONTEXT as any;
+			const cleanContext = {
+				client: originalContext?.client || {
+					hl: "en",
+					gl: "US",
+					clientName: "WEB",
+					clientVersion: "2.20230920.00.00", // Fallback if scrape failed
+					userAgent: COMMON_HEADERS['User-Agent'],
+					osName: "Windows",
+					osVersion: "10.0",
+				}
+			};
+
+			// Ensure we set the "Active Tab" flag
+			(cleanContext as any).client.isDocumentHidden = false;
 
 			const payload = {
-				context: this.config.INNERTUBE_CONTEXT,
+				context: cleanContext, // <--- Sending CLEAN context
 				continuation: continuationToken,
-				currentPlayerState: { playerOffsetMs: "0" },
-				webClientInfo: { isDocumentHidden: false }
+				currentPlayerState: { playerOffsetMs: "0" }
 			};
 
 			const res = await fetch(
@@ -142,9 +156,11 @@ export class YoutubeChatV3 implements DurableObject {
 			const data = await res.json<any>();
 			let actions: any[] = [];
 			
+			// Box A (Standard)
 			if (data.continuationContents?.liveChatContinuation?.actions) {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
 			}
+			// Box B (Lofi Girl / High Traffic)
 			if (data.onResponseReceivedEndpoints) {
 				for (const endpoint of data.onResponseReceivedEndpoints) {
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
@@ -163,6 +179,13 @@ export class YoutubeChatV3 implements DurableObject {
 			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
 				nextContinuation = data.continuationContents.liveChatContinuation.continuations?.[0];
 			}
+			// Fallback: Check inside actions for timedContinuationData (Lofi Girl specific)
+			if (!nextContinuation && actions.length > 0) {
+				const lastAction = actions[actions.length - 1];
+				// Sometimes the token is the last "action" itself if it's not a message
+				// For now, we rely on the standard locations.
+			}
+
 			nextToken = (nextContinuation ? getContinuationToken(nextContinuation) : undefined) ?? continuationToken;
 
 			for (const action of actions) {
@@ -214,7 +237,7 @@ export class YoutubeChatV3 implements DurableObject {
 		const adapter = this.makeAdapter(adapterType);
 		adapter.sockets.add(ws);
 		
-		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected! Checking Scraper..." }));
+		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected! Using SANITIZED Context..." }));
 		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
 
 		ws.addEventListener('close', () => {
