@@ -1,4 +1,4 @@
-name = "yt-chat-final" 
+name = "youtube-websocket" # We MUST keep the old name to satisfy the builder
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
@@ -7,9 +7,9 @@ compatibility_flags = ["nodejs_compat"]
 TRUFFLE_API_BASE = 'https://v2.truffle.vip'
 
 [durable_objects]
-# We use the V3 class we created
 bindings = [{ name = "YOUTUBE_CHAT", class_name = "YoutubeChatV3" }]
 
 [[migrations]]
-tag = "v1-init" 
-new_sqlite_classes = ["YoutubeChatV3"]
+tag = "v3-delete-old" # Unique tag
+new_sqlite_classes = ["YoutubeChatV3"] # Create the new V3 (Free)
+deleted_classes = ["YoutubeChat"] # <--- THE KEY: Destroy the old V1 (Paid)
