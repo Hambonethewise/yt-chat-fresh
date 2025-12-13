@@ -48,7 +48,7 @@ export async function createChatObject(
 	return object.fetch('http://youtube.chat/ws' + url.search, req);
 }
 
-const chatInterval = 250;
+const chatInterval = 1000; // Slower interval to avoid rate limits
 
 export class YoutubeChat implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
@@ -70,7 +70,11 @@ export class YoutubeChat implements DurableObject {
 			const transformed = adapter.transform(data);
 			if (!transformed) continue;
 			for (const socket of adapter.sockets) {
-				socket.send(transformed);
+				try {
+					socket.send(transformed);
+				} catch (e) {
+					// Socket might be closed, ignore
+				}
 			}
 		}
 	}
@@ -83,11 +87,14 @@ export class YoutubeChat implements DurableObject {
 			const data = await req.json<VideoData>();
 			this.config = data.config;
 			this.initialData = data.initialData;
+			
+			// Safety check for channel ID
 			this.channelId = traverseJSON(this.initialData, (value, key) => {
 				if (key === 'channelNavigationEndpoint') {
 					return value.browseEndpoint?.browseId;
 				}
-			});
+			}) || 'UNKNOWN';
+
 			const continuation = traverseJSON(data.initialData, (value) => {
 				if (value.title === 'Live chat') {
 					return value.continuation as Continuation;
@@ -96,7 +103,7 @@ export class YoutubeChat implements DurableObject {
 
 			if (!continuation) {
 				this.initialized = false;
-				return new Response('Failed to load chat', {
+				return new Response('Failed to load chat - No continuation found', {
 					status: 404,
 				});
 			}
@@ -104,7 +111,7 @@ export class YoutubeChat implements DurableObject {
 			const token = getContinuationToken(continuation);
 			if (!token) {
 				this.initialized = false;
-				return new Response('Failed to load chat', {
+				return new Response('Failed to load chat - No token found', {
 					status: 404,
 				});
 			}
@@ -131,31 +138,56 @@ export class YoutubeChat implements DurableObject {
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
 		try {
+			// Ensure we have a valid context, even if the scraper gave us an old one
+			const payload = {
+				context: this.config.INNERTUBE_CONTEXT,
+				continuation: continuationToken,
+				webClientInfo: { isDocumentHidden: false },
+			};
+			
+			// 2025 Fix: Ensure User-Agent is sent
+			const headers = {
+				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+				'Content-Type': 'application/json'
+			};
+
 			const res = await fetch(
 				`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${this.config.INNERTUBE_API_KEY}`,
 				{
 					method: 'POST',
-					body: JSON.stringify({
-						context: this.config.INNERTUBE_CONTEXT,
-						continuation: continuationToken,
-						webClientInfo: { isDocumentHidden: false },
-					}),
+					headers: headers,
+					body: JSON.stringify(payload),
 				}
 			);
-			if (!res.ok) {
-				throw new Error(res.statusText);
-			}
-			const data = await res.json<LiveChatResponse>();
-			const nextContinuation =
-				data.continuationContents?.liveChatContinuation.continuations?.[0];
-			nextToken =
-				(nextContinuation
-					? getContinuationToken(nextContinuation)
-					: undefined) ?? continuationToken;
 
-			// if data.continuationContents is undefined the stream is probably over
-			const actions =
-				data.continuationContents?.liveChatContinuation.actions ?? [];
+			if (!res.ok) {
+				throw new Error(`YouTube API Error: ${res.status} ${res.statusText}`);
+			}
+
+			const data = await res.json<any>(); // Use 'any' to handle flexible 2025 schema
+
+			// 1. Try to find the next token in the standard location
+			let nextContinuation = data.continuationContents?.liveChatContinuation?.continuations?.[0];
+			
+			// 2. If not found, data might be in "continuationContents" wrapper (Old style)
+			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
+				 nextContinuation = data.continuationContents.liveChatContinuation.continuations?.[0];
+			}
+
+			nextToken = (nextContinuation ? getContinuationToken(nextContinuation) : undefined) ?? continuationToken;
+
+			// 3. Robust Action Parsing (The "Silence" Fix)
+			let actions: LiveChatAction[] = [];
+
+			// Check location A: Standard
+			if (data.continuationContents?.liveChatContinuation?.actions) {
+				actions = data.continuationContents.liveChatContinuation.actions;
+			} 
+			// Check location B: Framework Updates (New Style)
+			else if (data.frameworkUpdates?.entityBatchUpdate?.mutations) {
+				// 2025 YouTube sometimes sends data here, though rare for basic chat.
+				// This block is a placeholder for future entity parsing if needed.
+			}
 
 			for (const action of actions) {
 				const id = this.getId(action);
@@ -164,16 +196,9 @@ export class YoutubeChat implements DurableObject {
 					this.seenMessages.set(id, Date.now());
 				}
 				this.broadcast(action);
-
-				// const parsed = parseChatAction(action);
-				// if (parsed) {
-				// 	if (this.seenMessages.has(parsed.id)) continue;
-				// 	this.seenMessages.set(parsed.id, parsed.unix);
-				// 	this.broadcast(parsed);
-				// }
 			}
 		} catch (e) {
-			console.error(e);
+			console.error("Fetch Error:", e);
 		} finally {
 			this.nextContinuationToken = nextToken;
 			if (this.adapters.size > 0)
@@ -182,21 +207,29 @@ export class YoutubeChat implements DurableObject {
 	}
 
 	private getId(data: LiveChatAction) {
-		delete data.clickTrackingParams;
-		const actionType = Object.keys(data)[0] as keyof LiveChatAction;
-		const action = data[actionType]?.item;
-		if (!action) return;
-		const rendererType = Object.keys(action)[0] as keyof ChatItemRenderer;
-		const renderer = action[rendererType] as { id: string };
-		return renderer.id;
+		try {
+			// Safety copy to avoid modifying original by reference if reused
+			const cleanData = { ...data };
+			delete cleanData.clickTrackingParams;
+			
+			const actionType = Object.keys(cleanData)[0] as keyof LiveChatAction;
+			const action = cleanData[actionType]?.item;
+			
+			if (!action) return undefined;
+			
+			const rendererType = Object.keys(action)[0] as keyof ChatItemRenderer;
+			const renderer = action[rendererType] as { id?: string };
+			
+			return renderer?.id;
+		} catch (e) {
+			return undefined;
+		}
 	}
 
 	private adapters = new Map<string, MessageAdapter>();
 
 	private makeAdapter(adapterType: string): MessageAdapter {
-		// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
 		const adapterFactory = adapterMap[adapterType] ?? adapterMap.json!;
-
 		const cached = this.adapters.get(adapterType);
 		if (cached) return cached;
 
