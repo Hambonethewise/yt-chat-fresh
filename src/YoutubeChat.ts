@@ -43,7 +43,6 @@ export class YoutubeChatV3 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
 	private channelId!: string;
 	private initialData!: VideoData['initialData'];
-	// Storage for our surgical keys
 	private apiKey!: string;
 	private clientVersion!: string;
 	private visitorData!: string;
@@ -128,7 +127,7 @@ export class YoutubeChatV3 implements DurableObject {
 						clientVersion: this.clientVersion,
 						hl: "en",
 						gl: "US",
-						visitorData: this.visitorData, // <--- CRITICAL
+						visitorData: this.visitorData,
 						userAgent: COMMON_HEADERS['User-Agent'],
 						osName: "Windows",
 						osVersion: "10.0",
