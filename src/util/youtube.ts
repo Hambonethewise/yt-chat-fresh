@@ -1,17 +1,10 @@
 import { Err, err, Ok, ok } from 'neverthrow';
-import {
-	Continuation,
-	isTextRun,
-	Json,
-	JsonObject,
-	Result,
-	YTString,
-} from './types';
+import { Continuation, isTextRun, Json, YTString } from './types';
 
-// Standard headers
 export const COMMON_HEADERS = {
 	'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 	'Accept-Language': 'en-US,en;q=0.9',
+	'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+417;',
 };
 
 export type VideoData = {
@@ -22,11 +15,16 @@ export type VideoData = {
 };
 
 export async function getVideoData(
-	urls: string[]
+	ids: string[]
 ): Promise<Ok<VideoData, unknown> | Err<unknown, [string, number]>> {
 	let response: Response | undefined;
 	
-	for (const url of urls) {
+	for (const id of ids) {
+		// --- THE PIVOT: FORCE POPOUT URL ---
+		// We ignore the standard watch link and go straight for the chat window.
+		// Popout URL: https://www.youtube.com/live_chat?is_popout=1&v=ID
+		const url = `https://www.youtube.com/live_chat?is_popout=1&v=${id}`;
+		
 		try {
 			response = await fetch(url, { headers: COMMON_HEADERS });
 			if (response.ok) break;
@@ -43,46 +41,34 @@ export async function getVideoData(
 
 	const text = await response.text();
 
-	// 1. API KEY
+	// 1. SURGICAL EXTRACTION
 	const apiKeyMatch = /"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/.exec(text);
 	if (!apiKeyMatch) return err(['Scraper: Missing API Key', 500]);
 	const apiKey = apiKeyMatch[1];
 
-	// 2. CLIENT VERSION
 	const versionMatch = /"clientVersion"\s*:\s*"([^"]+)"/.exec(text);
 	if (!versionMatch) return err(['Scraper: Missing Client Version', 500]);
 	const clientVersion = versionMatch[1];
 
-	// 3. VISITOR DATA
 	const visitorMatch = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(text);
 	const visitorData = visitorMatch ? visitorMatch[1] : "";
 
-	// 4. INITIAL DATA
-	const initialData = getMatch(
-		text,
-		/(?:var\s+ytInitialData|window\[['"]ytInitialData['"]\])\s*=\s*({[\s\S]+?});/
-	);
-	
+	// 2. INITIAL DATA (Popout structure often uses window["ytInitialData"])
+	let initialData = getMatch(text, /window\["ytInitialData"\]\s*=\s*({[\s\S]+?});/);
 	if (initialData.isErr()) {
-		const fallback = getMatch(text, /ytInitialData\s*=\s*({[\s\S]+?});/);
-		if (fallback.isErr()) return initialData;
-		return ok({ initialData: fallback.value, apiKey, clientVersion, visitorData });
+		// Fallback for standard structure
+		initialData = getMatch(text, /(?:var\s+ytInitialData|window\[['"]ytInitialData['"]\])\s*=\s*({[\s\S]+?});/);
 	}
+	
+	if (initialData.isErr()) return err(['Failed to parse ytInitialData from Popout', 500]);
 
 	return ok({ initialData: initialData.value, apiKey, clientVersion, visitorData });
 }
 
-function getMatch<T extends Json = Json>(
-	html: string,
-	pattern: RegExp
-): Result<T, [string, number]> {
+function getMatch<T extends Json = Json>(html: string, pattern: RegExp): Result<T, [string, number]> {
 	const match = pattern.exec(html);
-	if (!match?.[1]) return err(['Failed to find video data pattern', 404]);
-	try {
-		return ok(JSON.parse(match[1]));
-	} catch {
-		return err(['Failed to parse video data JSON', 500]);
-	}
+	if (!match?.[1]) return err(['Pattern not found', 404]);
+	try { return ok(JSON.parse(match[1])); } catch { return err(['JSON Parse Error', 500]); }
 }
 
 export function getContinuationToken(continuation: Continuation) {
@@ -96,19 +82,8 @@ export function parseYTString(string?: YTString): string {
 	if (string.runs)
 		return string.runs
 			.map((run) => {
-				if (isTextRun(run)) {
-					return run.text;
-				} else {
-					if (run.emoji.isCustomEmoji) {
-						return ` ${
-							run.emoji.image.accessibility?.accessibilityData?.label ??
-							run.emoji.searchTerms[1] ??
-							run.emoji.searchTerms[0]
-						} `;
-					} else {
-						return run.emoji.emojiId;
-					}
-				}
+				if (isTextRun(run)) return run.text;
+				return run.emoji.emojiId;
 			})
 			.join('')
 			.trim();
