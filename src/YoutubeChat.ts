@@ -54,17 +54,15 @@ export class YoutubeChatV3 implements DurableObject {
 		r.all('*', () => new Response('Not found', { status: 404 }));
 	}
 
-	private logToClient(message: string) {
-		const payload = JSON.stringify({ debug: true, message: message });
-		for (const adapter of this.adapters.values()) {
-			for (const socket of adapter.sockets) {
-				try { socket.send(payload); } catch (e) {}
-			}
-		}
-	}
-
 	private broadcast(data: any) {
 		for (const adapter of this.adapters.values()) {
+			// Support debug messages
+			if (data.debug) {
+				for (const socket of adapter.sockets) {
+					try { socket.send(JSON.stringify(data)); } catch (e) {}
+				}
+				continue;
+			}
 			const transformed = adapter.transform(data);
 			if (!transformed) continue;
 			for (const socket of adapter.sockets) {
@@ -117,29 +115,11 @@ export class YoutubeChatV3 implements DurableObject {
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
 		try {
-			// --- THE SANITIZER ---
-			// We strip out everything except the 'client' object.
-			// This removes "clickTracking", "adSignals", and other junk that causes 400 Errors.
-			const originalContext = this.config.INNERTUBE_CONTEXT as any;
-			const cleanContext = {
-				client: originalContext?.client || {
-					hl: "en",
-					gl: "US",
-					clientName: "WEB",
-					clientVersion: "2.20230920.00.00", // Fallback if scrape failed
-					userAgent: COMMON_HEADERS['User-Agent'],
-					osName: "Windows",
-					osVersion: "10.0",
-				}
-			};
-
-			// Ensure we set the "Active Tab" flag
-			(cleanContext as any).client.isDocumentHidden = false;
-
 			const payload = {
-				context: cleanContext, // <--- Sending CLEAN context
+				context: this.config.INNERTUBE_CONTEXT,
 				continuation: continuationToken,
-				currentPlayerState: { playerOffsetMs: "0" }
+				currentPlayerState: { playerOffsetMs: "0" },
+				webClientInfo: { isDocumentHidden: false }
 			};
 
 			const res = await fetch(
@@ -149,18 +129,16 @@ export class YoutubeChatV3 implements DurableObject {
 
 			if (!res.ok) {
 				const txt = await res.text();
-				this.logToClient(`[FETCH ERROR] ${res.status}: ${txt.slice(0, 100)}`);
+				this.broadcast({ debug: true, message: `[ERROR] API ${res.status}: ${txt.slice(0, 100)}` });
 				throw new Error(`YouTube API Error: ${res.status}`);
 			}
 
 			const data = await res.json<any>();
 			let actions: any[] = [];
 			
-			// Box A (Standard)
 			if (data.continuationContents?.liveChatContinuation?.actions) {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
 			}
-			// Box B (Lofi Girl / High Traffic)
 			if (data.onResponseReceivedEndpoints) {
 				for (const endpoint of data.onResponseReceivedEndpoints) {
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
@@ -170,22 +148,11 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			}
 
-			if (actions.length > 0) {
-				this.logToClient(`[SUCCESS] Found ${actions.length} messages`);
-			}
-
 			// Token Logic
 			let nextContinuation = data.continuationContents?.liveChatContinuation?.continuations?.[0];
 			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
 				nextContinuation = data.continuationContents.liveChatContinuation.continuations?.[0];
 			}
-			// Fallback: Check inside actions for timedContinuationData (Lofi Girl specific)
-			if (!nextContinuation && actions.length > 0) {
-				const lastAction = actions[actions.length - 1];
-				// Sometimes the token is the last "action" itself if it's not a message
-				// For now, we rely on the standard locations.
-			}
-
 			nextToken = (nextContinuation ? getContinuationToken(nextContinuation) : undefined) ?? continuationToken;
 
 			for (const action of actions) {
@@ -197,7 +164,7 @@ export class YoutubeChatV3 implements DurableObject {
 				this.broadcast(action);
 			}
 		} catch (e: any) {
-			this.logToClient(`[CRITICAL ERROR] ${e.message}`);
+			this.broadcast({ debug: true, message: `[CRASH] ${e.message}` });
 		} finally {
 			this.nextContinuationToken = nextToken;
 			if (this.adapters.size > 0) setTimeout(() => this.fetchChat(nextToken), chatInterval);
@@ -237,7 +204,7 @@ export class YoutubeChatV3 implements DurableObject {
 		const adapter = this.makeAdapter(adapterType);
 		adapter.sockets.add(ws);
 		
-		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected! Using SANITIZED Context..." }));
+		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected to V3 Robust Scraper" }));
 		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
 
 		ws.addEventListener('close', () => {
