@@ -29,7 +29,6 @@ export async function createChatObject(
 	const id = env.CHAT_DB.idFromName(videoId);
 	const object = env.CHAT_DB.get(id);
 	
-	// We pass the data to the Durable Object
 	const init = await object.fetch('http://youtube.chat/init', {
 		method: 'POST',
 		body: JSON.stringify(videoData),
@@ -40,7 +39,8 @@ export async function createChatObject(
 	return object.fetch('http://youtube.chat/ws' + url.search, req);
 }
 
-const chatInterval = 1000;
+// Default speed. We will slow this down if errors occur.
+const BASE_CHAT_INTERVAL = 1000;
 
 export class YoutubeChatV3 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
@@ -61,7 +61,7 @@ export class YoutubeChatV3 implements DurableObject {
 
 	private broadcast(data: any) {
 		for (const adapter of this.adapters.values()) {
-			// This is the debug block. You can comment it out later to silence logs.
+			// Debug block - comment out to silence logs
 			if (data.debug) {
 				for (const socket of adapter.sockets) {
 					try { socket.send(JSON.stringify(data)); } catch (e) {}
@@ -86,7 +86,7 @@ export class YoutubeChatV3 implements DurableObject {
 			
 			this.apiKey = data.apiKey;
 			this.clientVersion = data.clientVersion;
-			this.visitorData = data.visitorData;
+			this.visitorData = data.visitorData; // Store the visitor data
 			this.initialData = data.initialData;
 			
 			this.channelId = traverseJSON(this.initialData, (value, key) => {
@@ -123,8 +123,11 @@ export class YoutubeChatV3 implements DurableObject {
 
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
+		let currentInterval = BASE_CHAT_INTERVAL;
+
 		try {
-			// Construct context using the POPOUT page data
+			// --- HYBRID PAYLOAD ---
+			// Popout Strategy + Visitor Data = High Compatibility
 			const payload = {
 				context: {
 					client: {
@@ -132,7 +135,7 @@ export class YoutubeChatV3 implements DurableObject {
 						clientVersion: this.clientVersion,
 						hl: "en",
 						gl: "US",
-						visitorData: this.visitorData,
+						visitorData: this.visitorData, // <--- Added back for better auth
 						userAgent: COMMON_HEADERS['User-Agent'],
 						osName: "Windows",
 						osVersion: "10.0",
@@ -152,8 +155,10 @@ export class YoutubeChatV3 implements DurableObject {
 				const txt = await res.text();
 				this.broadcast({ 
 					debug: true, 
-					message: `[API ERROR] ${res.status} (Popout Strategy). Msg: ${txt.slice(0, 50)}` 
+					message: `[API ERROR] ${res.status}. Retrying in 5s...` 
 				});
+				// CRASH PREVENTION: Slow down if we hit an error
+				currentInterval = 5000; 
 				throw new Error(`YouTube API Error: ${res.status}`);
 			}
 
@@ -171,11 +176,6 @@ export class YoutubeChatV3 implements DurableObject {
 					if (reloadActions) actions.push(...reloadActions);
 				}
 			}
-			
-			// If we got actions, you could uncomment this to debug:
-			// if (actions.length > 0) {
-			//    this.broadcast({ debug: true, message: `[SUCCESS] ${actions.length} msgs from Popout` });
-			// }
 
 			let nextContinuation = data.continuationContents?.liveChatContinuation?.continuations?.[0];
 			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
@@ -192,10 +192,12 @@ export class YoutubeChatV3 implements DurableObject {
 				this.broadcast(action);
 			}
 		} catch (e: any) {
-			this.broadcast({ debug: true, message: `[CRASH] ${e.message}` });
+			this.broadcast({ debug: true, message: `[WARN] Loop error: ${e.message}` });
+			currentInterval = 5000; // Slow down on any crash
 		} finally {
 			this.nextContinuationToken = nextToken;
-			if (this.adapters.size > 0) setTimeout(() => this.fetchChat(nextToken), chatInterval);
+			if (this.adapters.size > 0)
+				setTimeout(() => this.fetchChat(nextToken), currentInterval);
 		}
 	}
 
@@ -232,7 +234,7 @@ export class YoutubeChatV3 implements DurableObject {
 		const adapter = this.makeAdapter(adapterType);
 		adapter.sockets.add(ws);
 		
-		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected (Targeting Popout)" }));
+		ws.send(JSON.stringify({ debug: true, message: "DEBUG: Connected (Hybrid Strategy)" }));
 		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
 
 		ws.addEventListener('close', () => {
