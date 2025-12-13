@@ -33,6 +33,7 @@ export async function createChatObject(
 	req: Request,
 	env: Env
 ): Promise<Response> {
+	// Updated to V2 ID generation
 	const id = env.YOUTUBE_CHAT.idFromName(videoId);
 	const object = env.YOUTUBE_CHAT.get(id);
 
@@ -49,7 +50,8 @@ export async function createChatObject(
 
 const chatInterval = 1000;
 
-export class YoutubeChat implements DurableObject {
+// RENAMED TO V2 HERE
+export class YoutubeChatV2 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
 	private channelId!: string;
 	private initialData!: VideoData['initialData'];
@@ -135,7 +137,6 @@ export class YoutubeChat implements DurableObject {
 	private async fetchChat(continuationToken: string) {
 		let nextToken = continuationToken;
 		try {
-			// FORCE 2025 BROWSER HEADERS
 			const headers = {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 				'Accept': '*/*',
@@ -148,7 +149,7 @@ export class YoutubeChat implements DurableObject {
 			const payload = {
 				context: this.config.INNERTUBE_CONTEXT,
 				continuation: continuationToken,
-				currentPlayerState: { playerOffsetMs: "0" } // Helps simulate a real viewer
+				currentPlayerState: { playerOffsetMs: "0" }
 			};
 
 			const res = await fetch(
@@ -162,33 +163,23 @@ export class YoutubeChat implements DurableObject {
 			}
 
 			const data = await res.json<any>();
-
-			// NUCLEAR LOGGING: If this works, you will see "Found X actions" in the logs.
-			// If it fails, you will see "DEBUG: Data Keys" showing you what YouTube actually sent.
 			
 			let actions: any[] = [];
 			
-			// STRATEGY 1: Standard
 			if (data.continuationContents?.liveChatContinuation?.actions) {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
 			}
 			
-			// STRATEGY 2: New Framework (Lofi Girl / High Traffic)
 			if (data.frameworkUpdates?.entityBatchUpdate?.mutations) {
-				// Sometimes actions are hidden in mutations. 
-				// For now, we just log that we saw them so we know to write a parser for it.
 				console.log("DEBUG: Found frameworkUpdates (New YouTube Format).");
 			}
 
-			// STRATEGY 3: OnResponseReceived (The "Box B" we talked about)
 			if (data.onResponseReceivedEndpoints) {
 				for (const endpoint of data.onResponseReceivedEndpoints) {
-					// Check for "appendContinuationItemsAction"
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
 					if (endpointActions) {
 						actions.push(...endpointActions);
 					}
-					// Check for "reloadContinuationItemsCommand" (Sometimes happens on reconnect)
 					const reloadActions = endpoint.reloadContinuationItemsCommand?.continuationItems;
 					if (reloadActions) {
 						actions.push(...reloadActions);
@@ -198,16 +189,9 @@ export class YoutubeChat implements DurableObject {
 
 			console.log(`DEBUG: Found ${actions.length} actions in this loop.`);
 
-			// Find Next Token
 			let nextContinuation = data.continuationContents?.liveChatContinuation?.continuations?.[0];
 			if (!nextContinuation && data.continuationContents?.liveChatContinuation) {
 				 nextContinuation = data.continuationContents.liveChatContinuation.continuations?.[0];
-			}
-			// Fallback check in "onResponseReceivedEndpoints" for the next token
-			// (Usually it's the LAST item in the actions array if it's not in the standard place)
-			if (!nextContinuation) {
-				// Logic: If we found no token, reuse the old one or look deeper.
-				// For safety, if we found actions, the last one might be a continuation wrapper.
 			}
 
 			nextToken = (nextContinuation ? getContinuationToken(nextContinuation) : undefined) ?? continuationToken;
