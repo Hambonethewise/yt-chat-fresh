@@ -33,7 +33,6 @@ export async function createChatObject(
 	req: Request,
 	env: Env
 ): Promise<Response> {
-	// Updated to V2 ID generation
 	const id = env.YOUTUBE_CHAT.idFromName(videoId);
 	const object = env.YOUTUBE_CHAT.get(id);
 
@@ -50,8 +49,8 @@ export async function createChatObject(
 
 const chatInterval = 1000;
 
-// RENAMED TO V2 HERE
-export class YoutubeChatV2 implements DurableObject {
+// CHANGED TO V3 HERE
+export class YoutubeChatV3 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
 	private channelId!: string;
 	private initialData!: VideoData['initialData'];
