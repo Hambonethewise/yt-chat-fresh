@@ -1,7 +1,7 @@
 name = "youtube-websocket"
 main = "src/index.ts"
-compatibility_date = "2022-09-24"
-node_compat = true
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
 
 [vars]
 TRUFFLE_API_BASE = 'https://v2.truffle.vip'
@@ -10,8 +10,5 @@ TRUFFLE_API_BASE = 'https://v2.truffle.vip'
 bindings = [{ name = "YOUTUBE_CHAT", class_name = "YoutubeChat" }]
 
 [[migrations]]
-tag = "v1"
-new_classes = ["YoutubeChat"]
-[[migrations]]
-tag = "v1"
+tag = "fix-sqlite-v2"
 new_sqlite_classes = ["YoutubeChat"]
