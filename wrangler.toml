@@ -1,4 +1,4 @@
-name = "youtube-websocket"
+name = "yt-chat-fresh" # Matches the new Repo Name
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
@@ -7,10 +7,9 @@ compatibility_flags = ["nodejs_compat"]
 TRUFFLE_API_BASE = 'https://v2.truffle.vip'
 
 [durable_objects]
-# CHANGED BINDING NAME to CHAT_DB
+# We keep the V3 code you already have
 bindings = [{ name = "CHAT_DB", class_name = "YoutubeChatV3" }]
 
 [[migrations]]
-tag = "v3-clean-deploy" 
+tag = "v1-init" # A fresh start tag
 new_sqlite_classes = ["YoutubeChatV3"]
-deleted_classes = ["YoutubeChat"]
