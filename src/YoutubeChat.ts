@@ -49,7 +49,6 @@ export class YoutubeChatV3 implements DurableObject {
 	private clientVersion!: string;
 	private visitorData!: string;
 	private seenMessages = new Map<string, number>();
-	private loopCount = 0; 
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -73,7 +72,7 @@ export class YoutubeChatV3 implements DurableObject {
 
 	private broadcast(data: any) {
 		for (const adapter of this.adapters.values()) {
-			// Sending DEBUG messages to help you verify it is working
+			// Sending DEBUG messages to help verify the fix
 			if (data.debug) {
 				for (const socket of adapter.sockets) {
 					try { socket.send(JSON.stringify(data)); } catch (e) {}
@@ -171,18 +170,17 @@ export class YoutubeChatV3 implements DurableObject {
 
 			// --- THE HARD RESET ---
 			// Race the fetch against a 10s timer. Whoever finishes first wins.
-			// If timer wins, we throw an error to break the freeze.
+			// If timer wins, we reject immediately.
 			const timeoutPromise = new Promise<Response>((_, reject) => 
 				setTimeout(() => {
 					controller.abort();
-					reject(new Error("Timeout"));
+					reject(new Error("ForceTimeout"));
 				}, 10000)
 			);
 
 			const res = await Promise.race([fetchPromise, timeoutPromise]);
 
 			if (!res.ok) {
-				this.broadcast({ debug: true, message: `[STATUS] API ${res.status}. Retrying...` });
 				currentInterval = 5000; 
 			} else {
 				const data = await res.json<any>();
@@ -220,8 +218,10 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			}
 		} catch (e: any) {
-			// Debug log to confirm we are resetting the loop
-			// this.broadcast({ debug: true, message: "[INFO] Connection Reset. Reconnecting..." });
+			// LOG THE FIX: If you see this in the console, it means the code saved you.
+			if (e.message === "ForceTimeout") {
+				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Connection hung. Force resetting..." });
+			}
 			currentInterval = 5000;
 		} finally {
 			this.nextContinuationToken = nextToken;
