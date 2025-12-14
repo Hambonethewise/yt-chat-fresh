@@ -49,7 +49,7 @@ export class YoutubeChatV3 implements DurableObject {
 	private clientVersion!: string;
 	private visitorData!: string;
 	private seenMessages = new Map<string, number>();
-	private isLoopRunning = false; // <--- THE GUARD FLAG
+	private isLoopRunning = false; 
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -118,7 +118,7 @@ export class YoutubeChatV3 implements DurableObject {
 				return new Response('No token found', { status: 404 });
 			}
 
-			// START THE LOOP (ONLY HERE)
+			// START THE LOOP (If not already running)
 			if (!this.isLoopRunning) {
 				this.fetchChat(token);
 			}
@@ -226,17 +226,11 @@ export class YoutubeChatV3 implements DurableObject {
 			currentInterval = 5000;
 		} finally {
 			this.nextContinuationToken = nextToken;
-			if (this.adapters.size > 0)
-				setTimeout(() => this.fetchChat(nextToken), currentInterval);
-			else {
-				// If no one is listening, we stop the loop to save resources.
-				// It will restart automatically when someone connects because init() persists or 
-				// we can re-enable logic to start on connect if we wanted to (but safer to keep running for now).
-				// For this fix, let's KEEP IT RUNNING to prevent the "deadlock" on reconnect.
-				// setTimeout(() => this.fetchChat(nextToken), currentInterval);
-				
-				// ACTUALLY: The safe bet for your specific issue is to ALWAYS loop.
-			}
+			
+			// --- THE IMMORTAL FIX ---
+			// We ALWAYS call this, regardless of adapter count.
+			// The loop must never die.
+			setTimeout(() => this.fetchChat(nextToken), currentInterval);
 		}
 	}
 
@@ -274,11 +268,6 @@ export class YoutubeChatV3 implements DurableObject {
 		adapter.sockets.add(ws);
 		
 		ws.send(JSON.stringify({ debug: true, message: "Connected. Listening for chat..." }));
-		
-		// --- THE FIX ---
-		// REMOVED: if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
-		// Reason: The loop is ALREADY running from init(). 
-		// Calling it here created a duplicate loop that crashed the connection.
 
 		ws.addEventListener('close', () => {
 			adapter.sockets.delete(ws);
