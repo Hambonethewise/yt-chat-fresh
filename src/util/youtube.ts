@@ -80,7 +80,7 @@ export function getContinuationToken(continuation: Continuation) {
 	return continuation[key]?.continuation;
 }
 
-// --- EMOTE PARSING FIX ---
+// --- RUTHLESS EMOTE FILTER ---
 export function parseYTString(string?: YTString): string {
 	if (!string) return '';
 	if (string.simpleText) return string.simpleText;
@@ -88,35 +88,39 @@ export function parseYTString(string?: YTString): string {
 	if (string.runs) {
 		return string.runs
 			.map((run) => {
-				// 1. If it's normal text, just return it
+				// 1. Text? Keep it.
 				if (isTextRun(run)) {
 					return run.text;
 				} 
 				
-				// 2. If it's an Emoji/Sticker
+				// 2. Emoji? Check STRICT conditions.
 				if (run.emoji) {
-					// Try to get the shortcode (e.g. ":smile:")
+					// Condition A: It has a search term like ":smile:"
 					if (run.emoji.searchTerms && run.emoji.searchTerms.length > 0) {
 						return run.emoji.searchTerms[0];
 					}
-					// Try to get the label (e.g. "Smile")
+					
+					// Condition B: It has a shortcut like ":)"
+					// Only accept if it looks like a standard emoticon, not an ID
+					if (run.emoji.shortcuts && run.emoji.shortcuts.length > 0) {
+						const shortcut = run.emoji.shortcuts[0];
+						// If shortcut is super long, it's likely an ID, so kill it.
+						if (shortcut.length < 10) return shortcut;
+					}
+
+					// Condition C: It has a Label like "Smile"
 					if (run.emoji.image?.accessibility?.accessibilityData?.label) {
 						return `:${run.emoji.image.accessibility.accessibilityData.label}:`;
 					}
-					// Try shortcuts (e.g. ":)")
-					if (run.emoji.shortcuts && run.emoji.shortcuts.length > 0) {
-						return run.emoji.shortcuts[0];
-					}
 					
-					// 3. FINAL FALLBACK:
-					// If we can't find a text name, return NOTHING.
-					// Do NOT return the emojiId (that causes the crash).
+					// If none of the above matches, DESTROY IT.
+					// Do not return emojiId. Do not return image URL.
 					return ''; 
 				}
 				
 				return '';
 			})
-			.join(''); // Join without extra spaces, let the text runs handle spacing
+			.join(''); 
 	}
 	return '';
 }
