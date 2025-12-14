@@ -49,11 +49,13 @@ export class YoutubeChatV3 implements DurableObject {
 	private apiKey!: string;
 	private clientVersion!: string;
 	private visitorData!: string;
-	// MEMORY FIX: Only store the last 50 IDs.
+	
+	// STRICT MEMORY CONTROL
 	private recentMessageIds = new Set<string>();
 	private isLoopRunning = false; 
 	private nextContinuationToken?: string; 
 	private lastMessageTime = Date.now(); 
+	private bootTime = Date.now(); // The "Time Barrier"
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -103,6 +105,10 @@ export class YoutubeChatV3 implements DurableObject {
 	private initialized = false;
 	private init: Handler = (req) => {
 		return this.state.blockConcurrencyWhile(async () => {
+			// RESET THE TIME BARRIER ON CONNECT
+			// We only want messages that happen AFTER this specific connection
+			this.bootTime = Date.now();
+			
 			if (this.initialized) {
 				this.lastMessageTime = Date.now(); 
 				try {
@@ -155,25 +161,22 @@ export class YoutubeChatV3 implements DurableObject {
 		});
 	};
 
-	// MEMORY FIX: Strict Limit
-	// This function forces the set to never exceed 50 items.
+	// STRICT MEMORY: Only keep 50 IDs. 
 	private trackMessageId(id: string): boolean {
-		if (this.recentMessageIds.has(id)) return false; // Duplicate
-		
+		if (this.recentMessageIds.has(id)) return false; 
 		this.recentMessageIds.add(id);
-		
-		// If we have too many, delete the oldest (first one in the Set)
 		if (this.recentMessageIds.size > 50) {
-			const oldest = this.recentMessageIds.values().next().value;
-			this.recentMessageIds.delete(oldest);
+			const first = this.recentMessageIds.values().next().value;
+			this.recentMessageIds.delete(first);
 		}
-		return true; // New message
+		return true; 
 	}
 
-	// --- AUTO-HEAL ---
 	private async forceRefreshSession(): Promise<boolean> {
 		if (!this.videoId) return false; 
-		this.broadcast({ debug: true, message: "♻️ [AUTO-HEAL] Stale chat detected. Refreshing token..." });
+		// Set barrier to NOW so we don't fetch old history during recovery
+		this.bootTime = Date.now();
+		this.broadcast({ debug: true, message: "♻️ [AUTO-HEAL] Refreshing token..." });
 		
 		try {
 			const url = `https://www.youtube.com/live_chat?is_popout=1&v=${this.videoId}`;
@@ -196,14 +199,11 @@ export class YoutubeChatV3 implements DurableObject {
 					if (token) {
 						this.nextContinuationToken = token;
 						this.lastMessageTime = Date.now(); 
-						this.broadcast({ debug: true, message: "✅ [AUTO-HEAL] Success! Resuming chat." });
 						return true;
 					}
 				}
 			}
-		} catch (e) {
-			this.broadcast({ debug: true, message: "❌ [AUTO-HEAL] Failed." });
-		}
+		} catch (e) {}
 		return false;
 	}
 
@@ -211,12 +211,11 @@ export class YoutubeChatV3 implements DurableObject {
 		this.isLoopRunning = true; 
 		let currentInterval = BASE_CHAT_INTERVAL;
 
-		// 1. Deadman Switch
+		// Deadman Switch: 30s silence = Refresh
 		const timeSinceLastMessage = Date.now() - this.lastMessageTime;
 		if (timeSinceLastMessage > 30000) {
 			const recovered = await this.forceRefreshSession();
 			if (!recovered) {
-				// If recovery failed, DO NOT proceed with old token. Wait and loop.
 				setTimeout(() => this.fetchChat(), 5000);
 				return;
 			}
@@ -303,18 +302,31 @@ export class YoutubeChatV3 implements DurableObject {
 			}
 
 			for (const action of actions) {
+				// --- THE TIME BARRIER ---
+				// Get the timestamp of the message
+				let msgTimestamp = 0;
+				try {
+					const renderer = action.liveChatTextMessageRenderer || action.liveChatPaidMessageRenderer;
+					if (renderer && renderer.timestampUsec) {
+						msgTimestamp = parseInt(renderer.timestampUsec) / 1000;
+					}
+				} catch(e) {}
+
+				// TRASH anything older than our boot time (The "Flood" Fix)
+				// We allow a small 5s buffer for network latency
+				if (msgTimestamp > 0 && msgTimestamp < (this.bootTime - 5000)) {
+					continue; 
+				}
+
 				const id = this.getId(action);
 				if (id) {
-					// Use new Strict Memory Tracker
 					if (!this.trackMessageId(id)) continue; 
 				}
 				this.broadcast(action);
 			}
 
 		} catch (e: any) {
-			if (e.message === "ForceTimeout" || e.name === 'AbortError') {
-				// Silent retry
-			}
+			// Silent error handling
 			currentInterval = 5000;
 		} finally {
 			setTimeout(() => this.fetchChat(), currentInterval);
