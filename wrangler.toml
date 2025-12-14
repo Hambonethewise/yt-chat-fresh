@@ -1,15 +1,14 @@
-name = "yt-chat-fresh" # Matches the new Repo Name
+name = "yt-chat-fresh"
 main = "src/index.ts"
-compatibility_date = "2024-01-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2024-01-01"  # <--- CRITICAL: Must be newer than Oct 2022
 
-[vars]
-TRUFFLE_API_BASE = 'https://v2.truffle.vip'
+# ... your other vars ...
 
 [durable_objects]
-# We keep the V3 code you already have
-bindings = [{ name = "CHAT_DB", class_name = "YoutubeChatV3" }]
+bindings = [
+  { name = "CHAT_DB", class_name = "YoutubeChatV3" }
+]
 
 [[migrations]]
-tag = "v1-init" # A fresh start tag
-new_sqlite_classes = ["YoutubeChatV3"]
+tag = "v1" # Or your next version number
+new_classes = ["YoutubeChatV3"]
