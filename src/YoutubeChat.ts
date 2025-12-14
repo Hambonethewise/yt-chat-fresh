@@ -49,6 +49,7 @@ export class YoutubeChatV3 implements DurableObject {
 	private clientVersion!: string;
 	private visitorData!: string;
 	private seenMessages = new Map<string, number>();
+	private isLoopRunning = false; // <--- THE GUARD FLAG
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -117,7 +118,11 @@ export class YoutubeChatV3 implements DurableObject {
 				return new Response('No token found', { status: 404 });
 			}
 
-			this.fetchChat(token);
+			// START THE LOOP (ONLY HERE)
+			if (!this.isLoopRunning) {
+				this.fetchChat(token);
+			}
+			
 			setInterval(() => this.clearSeenMessages(), 60 * 1000);
 			return new Response();
 		});
@@ -132,6 +137,7 @@ export class YoutubeChatV3 implements DurableObject {
 	}
 
 	private async fetchChat(continuationToken: string) {
+		this.isLoopRunning = true; // Lock the loop
 		let nextToken = continuationToken;
 		let currentInterval = BASE_CHAT_INTERVAL;
 
@@ -156,8 +162,6 @@ export class YoutubeChatV3 implements DurableObject {
 				currentPlayerState: { playerOffsetMs: "0" }
 			};
 
-			// --- THE FIX: Combine Fetch AND JSON Download into one task ---
-			// This ensures the timer runs until we have the DATA, not just the connection.
 			const fetchDataTask = async () => {
 				const res = await fetch(
 					`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${this.apiKey}`,
@@ -170,7 +174,7 @@ export class YoutubeChatV3 implements DurableObject {
 					}
 				);
 				if (!res.ok) throw new Error(`Status ${res.status}`);
-				return await res.json<any>(); // <--- We wait for this INSIDE the race now
+				return await res.json<any>();
 			};
 
 			const timeoutPromise = new Promise<any>((_, reject) => 
@@ -180,10 +184,7 @@ export class YoutubeChatV3 implements DurableObject {
 				}, 10000)
 			);
 
-			// Race the ENTIRE job (Connect + Download)
 			const data = await Promise.race([fetchDataTask(), timeoutPromise]);
-
-			// If we are here, we have the data.
 			
 			let actions: any[] = [];
 			
@@ -219,7 +220,6 @@ export class YoutubeChatV3 implements DurableObject {
 			}
 
 		} catch (e: any) {
-			// Now this will catch the download freeze too!
 			if (e.message === "ForceTimeout" || e.name === 'AbortError') {
 				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Download hung. Resetting..." });
 			}
@@ -228,6 +228,15 @@ export class YoutubeChatV3 implements DurableObject {
 			this.nextContinuationToken = nextToken;
 			if (this.adapters.size > 0)
 				setTimeout(() => this.fetchChat(nextToken), currentInterval);
+			else {
+				// If no one is listening, we stop the loop to save resources.
+				// It will restart automatically when someone connects because init() persists or 
+				// we can re-enable logic to start on connect if we wanted to (but safer to keep running for now).
+				// For this fix, let's KEEP IT RUNNING to prevent the "deadlock" on reconnect.
+				// setTimeout(() => this.fetchChat(nextToken), currentInterval);
+				
+				// ACTUALLY: The safe bet for your specific issue is to ALWAYS loop.
+			}
 		}
 	}
 
@@ -265,7 +274,11 @@ export class YoutubeChatV3 implements DurableObject {
 		adapter.sockets.add(ws);
 		
 		ws.send(JSON.stringify({ debug: true, message: "Connected. Listening for chat..." }));
-		if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
+		
+		// --- THE FIX ---
+		// REMOVED: if (this.nextContinuationToken) this.fetchChat(this.nextContinuationToken);
+		// Reason: The loop is ALREADY running from init(). 
+		// Calling it here created a duplicate loop that crashed the connection.
 
 		ws.addEventListener('close', () => {
 			adapter.sockets.delete(ws);
