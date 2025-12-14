@@ -72,7 +72,6 @@ export class YoutubeChatV3 implements DurableObject {
 
 	private broadcast(data: any) {
 		for (const adapter of this.adapters.values()) {
-			// Debug logs for verification
 			if (data.debug) {
 				for (const socket of adapter.sockets) {
 					try { socket.send(JSON.stringify(data)); } catch (e) {}
@@ -168,7 +167,6 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			);
 
-			// --- THE HARD RESET (CONFIRM THIS IS IN YOUR FILE) ---
 			const timeoutPromise = new Promise<Response>((_, reject) => 
 				setTimeout(() => {
 					controller.abort();
@@ -176,13 +174,23 @@ export class YoutubeChatV3 implements DurableObject {
 				}, 10000)
 			);
 
-			// This race guarantees we never wait longer than 10 seconds
+			// Start the race
 			const res = await Promise.race([fetchPromise, timeoutPromise]);
+
+			// IMPORTANT: Do NOT clear the timeout here! 
+			// We must wait until the JSON is downloaded.
 
 			if (!res.ok) {
 				currentInterval = 5000; 
 			} else {
-				const data = await res.json<any>();
+				// The timeout is still ticking while we download this...
+				const data = await res.json<any>(); 
+				
+				// NOW it is safe to stop the timer. We have the data.
+				// (We can't actually clear the specific ID easily from here, 
+				// but because we finished, the abort below won't matter, 
+				// or the loop will naturally continue).
+				
 				let actions: any[] = [];
 				
 				if (data.continuationContents?.liveChatContinuation?.actions) {
@@ -217,9 +225,8 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			}
 		} catch (e: any) {
-			// You will see this log if the fix saves you
-			if (e.message === "ForceTimeout") {
-				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Connection hung. Force resetting..." });
+			if (e.message === "ForceTimeout" || e.name === 'AbortError') {
+				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Data download hung. Resetting..." });
 			}
 			currentInterval = 5000;
 		} finally {
