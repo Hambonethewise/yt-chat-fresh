@@ -44,6 +44,7 @@ const BASE_CHAT_INTERVAL = 3000;
 export class YoutubeChatV3 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
 	private channelId!: string;
+	private videoId!: string; // Saved to allow auto-recovery
 	private initialData!: VideoData['initialData'];
 	private apiKey!: string;
 	private clientVersion!: string;
@@ -51,6 +52,7 @@ export class YoutubeChatV3 implements DurableObject {
 	private seenMessages = new Map<string, number>();
 	private isLoopRunning = false; 
 	private nextContinuationToken?: string; 
+	private emptyResponseCount = 0; // Tracks staleness
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -72,12 +74,10 @@ export class YoutubeChatV3 implements DurableObject {
 		}
 	}
 
-	// Helper to send data safely and detect dead sockets
 	private safeSend(socket: WebSocket, data: string) {
 		try {
 			socket.send(data);
 		} catch (e) {
-			// If sending fails, the socket is dead. Close it.
 			try { socket.close(); } catch(e) {}
 		}
 	}
@@ -110,9 +110,7 @@ export class YoutubeChatV3 implements DurableObject {
 					});
 					if (continuation) {
 						const token = getContinuationToken(continuation);
-						if (token) {
-							this.nextContinuationToken = token;
-						}
+						if (token) this.nextContinuationToken = token;
 					}
 				} catch(e) {}
 				return new Response();
@@ -162,9 +160,46 @@ export class YoutubeChatV3 implements DurableObject {
 		}
 	}
 
+	// --- AUTO-HEALING LOGIC ---
+	private async recoverSession() {
+		if (!this.videoId) return; 
+		this.broadcast({ debug: true, message: "⚠️ [SELF-HEAL] Connection stale. Refreshing..." });
+		
+		try {
+			// Re-scrape the video page to get a FRESH token
+			const url = `https://www.youtube.com/live_chat?is_popout=1&v=${this.videoId}`;
+			const response = await fetch(url, { headers: COMMON_HEADERS });
+			const text = await response.text();
+			
+			// Simple Regex to find the initial data
+			const match = text.match(/window\["ytInitialData"\]\s*=\s*({.+?});/);
+			if (match && match[1]) {
+				const json = JSON.parse(match[1]);
+				const continuation = traverseJSON(json, (value) => {
+					if (value.title === 'Live chat') return value.continuation as Continuation;
+				});
+				if (continuation) {
+					const token = getContinuationToken(continuation);
+					if (token) {
+						this.nextContinuationToken = token;
+						this.emptyResponseCount = 0;
+						this.broadcast({ debug: true, message: "✅ [SELF-HEAL] Recovered with fresh token!" });
+					}
+				}
+			}
+		} catch (e) {
+			this.broadcast({ debug: true, message: "❌ [SELF-HEAL] Failed." });
+		}
+	}
+
 	private async fetchChat() {
 		this.isLoopRunning = true; 
 		let currentInterval = BASE_CHAT_INTERVAL;
+
+		// 1. Check for Stale Connection
+		if (this.emptyResponseCount > 5) {
+			await this.recoverSession();
+		}
 
 		const tokenToUse = this.nextContinuationToken;
 
@@ -218,20 +253,30 @@ export class YoutubeChatV3 implements DurableObject {
 
 			const data = await Promise.race([fetchDataTask(), timeoutPromise]);
 			
+			// 2. Process Data
 			let actions: any[] = [];
+			let hasData = false;
 			
 			if (data.continuationContents?.liveChatContinuation?.actions) {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
+				hasData = true;
 			}
 			if (data.onResponseReceivedEndpoints) {
 				for (const endpoint of data.onResponseReceivedEndpoints) {
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
-					if (endpointActions) actions.push(...endpointActions);
+					if (endpointActions) {
+						actions.push(...endpointActions);
+						hasData = true;
+					}
 					const reloadActions = endpoint.reloadContinuationItemsCommand?.continuationItems;
-					if (reloadActions) actions.push(...reloadActions);
+					if (reloadActions) {
+						actions.push(...reloadActions);
+						hasData = true;
+					}
 				}
 			}
 
+			// 3. Update Token
 			const foundToken = traverseJSON(data, (value, key) => {
 				if (key === "continuation" && typeof value === "string") {
 					return value;
@@ -240,6 +285,13 @@ export class YoutubeChatV3 implements DurableObject {
 
 			if (foundToken) {
 				this.nextContinuationToken = foundToken;
+			}
+
+			// 4. Track Staleness
+			if (!hasData) {
+				this.emptyResponseCount++;
+			} else {
+				this.emptyResponseCount = 0; // Reset on success
 			}
 
 			for (const action of actions) {
@@ -287,6 +339,12 @@ export class YoutubeChatV3 implements DurableObject {
 	private handleWebsocket: Handler = async (req) => {
 		if (req.headers.get('Upgrade') !== 'websocket') return new Response('Expected a websocket', { status: 400 });
 		const url = new URL(req.url);
+		
+		// Capture Video ID from URL for auto-recovery
+		const parts = url.pathname.split('/');
+		const possibleId = parts[parts.length - 1];
+		if (possibleId && possibleId !== 'ws') this.videoId = possibleId;
+
 		const adapterType = url.searchParams.get('adapter') ?? 'json';
 		const pair = new WebSocketPair();
 		const ws = pair[1];
