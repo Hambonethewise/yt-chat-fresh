@@ -30,6 +30,7 @@ export async function getVideoData(
 			videoId = input;
 		}
 
+		// Force Popout URL for cleaner data
 		const url = `https://www.youtube.com/live_chat?is_popout=1&v=${videoId}`;
 		
 		try {
@@ -80,7 +81,8 @@ export function getContinuationToken(continuation: Continuation) {
 	return continuation[key]?.continuation;
 }
 
-// --- RUTHLESS EMOTE FILTER ---
+// --- THE CLEANER ---
+// This function decides what text gets sent to Resonite.
 export function parseYTString(string?: YTString): string {
 	if (!string) return '';
 	if (string.simpleText) return string.simpleText;
@@ -88,33 +90,30 @@ export function parseYTString(string?: YTString): string {
 	if (string.runs) {
 		return string.runs
 			.map((run) => {
-				// 1. Text? Keep it.
+				// 1. Regular Text? Keep it.
 				if (isTextRun(run)) {
 					return run.text;
 				} 
 				
-				// 2. Emoji? Check STRICT conditions.
+				// 2. Emoji? Be RUTHLESS.
 				if (run.emoji) {
-					// Condition A: It has a search term like ":smile:"
-					if (run.emoji.searchTerms && run.emoji.searchTerms.length > 0) {
-						return run.emoji.searchTerms[0];
-					}
-					
-					// Condition B: It has a shortcut like ":)"
-					// Only accept if it looks like a standard emoticon, not an ID
+					// Is it a standard emoji (like 😀) or a simple shortcut (like :) )?
+					// We check if the shortcut is short (less than 6 chars).
+					// If it's long, it's likely an internal ID -> DELETE IT.
 					if (run.emoji.shortcuts && run.emoji.shortcuts.length > 0) {
 						const shortcut = run.emoji.shortcuts[0];
-						// If shortcut is super long, it's likely an ID, so kill it.
-						if (shortcut.length < 10) return shortcut;
+						if (shortcut.length < 6) return shortcut; // Keep ":)"
 					}
 
-					// Condition C: It has a Label like "Smile"
+					// Is it a labeled emoji (like "Smile")?
+					// Only keep it if it looks like a normal word, not a code.
 					if (run.emoji.image?.accessibility?.accessibilityData?.label) {
-						return `:${run.emoji.image.accessibility.accessibilityData.label}:`;
+						const label = run.emoji.image.accessibility.accessibilityData.label;
+						if (label.length < 15) return `:${label}:`; // Keep ":Smile:"
 					}
 					
-					// If none of the above matches, DESTROY IT.
-					// Do not return emojiId. Do not return image URL.
+					// If it didn't pass the checks above, it's a "Poison Pill".
+					// RETURN NOTHING. Delete it from existence.
 					return ''; 
 				}
 				
