@@ -44,7 +44,7 @@ const BASE_CHAT_INTERVAL = 3000;
 export class YoutubeChatV3 implements DurableObject {
 	private router: Router<Request, IHTTPMethods>;
 	private channelId!: string;
-	private videoId!: string; // Saved to allow auto-recovery
+	private videoId!: string; 
 	private initialData!: VideoData['initialData'];
 	private apiKey!: string;
 	private clientVersion!: string;
@@ -52,7 +52,7 @@ export class YoutubeChatV3 implements DurableObject {
 	private seenMessages = new Map<string, number>();
 	private isLoopRunning = false; 
 	private nextContinuationToken?: string; 
-	private emptyResponseCount = 0; // Tracks staleness
+	private lastMessageTime = Date.now(); // Tracks the last time we saw a REAL chat message
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -103,6 +103,8 @@ export class YoutubeChatV3 implements DurableObject {
 	private init: Handler = (req) => {
 		return this.state.blockConcurrencyWhile(async () => {
 			if (this.initialized) {
+				// If reconnecting, update the timestamp so we don't instant-refresh
+				this.lastMessageTime = Date.now(); 
 				try {
 					const data = await req.json<VideoData>();
 					const continuation = traverseJSON(data.initialData, (value) => {
@@ -123,6 +125,7 @@ export class YoutubeChatV3 implements DurableObject {
 			this.clientVersion = data.clientVersion;
 			this.visitorData = data.visitorData; 
 			this.initialData = data.initialData;
+			this.lastMessageTime = Date.now();
 			
 			this.channelId = traverseJSON(this.initialData, (value, key) => {
 				if (key === 'channelNavigationEndpoint') return value.browseEndpoint?.browseId;
@@ -160,21 +163,26 @@ export class YoutubeChatV3 implements DurableObject {
 		}
 	}
 
-	// --- AUTO-HEALING LOGIC ---
-	private async recoverSession() {
+	// --- THE FIX: DEADMAN SWITCH ---
+	// If we haven't seen a real chat message in 30 seconds, we re-scrape the HTML.
+	private async forceRefreshSession() {
 		if (!this.videoId) return; 
-		this.broadcast({ debug: true, message: "⚠️ [SELF-HEAL] Connection stale. Refreshing..." });
+		// this.broadcast({ debug: true, message: "⚠️ [AUTO-REFRESH] No chat for 30s. Resyncing..." });
 		
 		try {
-			// Re-scrape the video page to get a FRESH token
 			const url = `https://www.youtube.com/live_chat?is_popout=1&v=${this.videoId}`;
 			const response = await fetch(url, { headers: COMMON_HEADERS });
 			const text = await response.text();
 			
-			// Simple Regex to find the initial data
-			const match = text.match(/window\["ytInitialData"\]\s*=\s*({.+?});/);
-			if (match && match[1]) {
-				const json = JSON.parse(match[1]);
+			// Robust Regex to find the data in the HTML
+			let json;
+			const match1 = text.match(/window\["ytInitialData"\]\s*=\s*({.+?});/);
+			const match2 = text.match(/var\s+ytInitialData\s*=\s*({.+?});/);
+			
+			if (match1) json = JSON.parse(match1[1]);
+			else if (match2) json = JSON.parse(match2[1]);
+
+			if (json) {
 				const continuation = traverseJSON(json, (value) => {
 					if (value.title === 'Live chat') return value.continuation as Continuation;
 				});
@@ -182,13 +190,13 @@ export class YoutubeChatV3 implements DurableObject {
 					const token = getContinuationToken(continuation);
 					if (token) {
 						this.nextContinuationToken = token;
-						this.emptyResponseCount = 0;
-						this.broadcast({ debug: true, message: "✅ [SELF-HEAL] Recovered with fresh token!" });
+						this.lastMessageTime = Date.now(); // Reset the timer
+						// this.broadcast({ debug: true, message: "✅ [AUTO-REFRESH] Resync successful." });
 					}
 				}
 			}
 		} catch (e) {
-			this.broadcast({ debug: true, message: "❌ [SELF-HEAL] Failed." });
+			// Fail silently, we'll try again in the next loop
 		}
 	}
 
@@ -196,9 +204,10 @@ export class YoutubeChatV3 implements DurableObject {
 		this.isLoopRunning = true; 
 		let currentInterval = BASE_CHAT_INTERVAL;
 
-		// 1. Check for Stale Connection
-		if (this.emptyResponseCount > 5) {
-			await this.recoverSession();
+		// 1. Check Deadman Switch (30 seconds of silence = STALE)
+		const timeSinceLastMessage = Date.now() - this.lastMessageTime;
+		if (timeSinceLastMessage > 30000) {
+			await this.forceRefreshSession();
 		}
 
 		const tokenToUse = this.nextContinuationToken;
@@ -253,30 +262,25 @@ export class YoutubeChatV3 implements DurableObject {
 
 			const data = await Promise.race([fetchDataTask(), timeoutPromise]);
 			
-			// 2. Process Data
 			let actions: any[] = [];
-			let hasData = false;
 			
 			if (data.continuationContents?.liveChatContinuation?.actions) {
 				actions.push(...data.continuationContents.liveChatContinuation.actions);
-				hasData = true;
 			}
 			if (data.onResponseReceivedEndpoints) {
 				for (const endpoint of data.onResponseReceivedEndpoints) {
 					const endpointActions = endpoint.appendContinuationItemsAction?.continuationItems;
-					if (endpointActions) {
-						actions.push(...endpointActions);
-						hasData = true;
-					}
+					if (endpointActions) actions.push(...endpointActions);
 					const reloadActions = endpoint.reloadContinuationItemsCommand?.continuationItems;
-					if (reloadActions) {
-						actions.push(...reloadActions);
-						hasData = true;
-					}
+					if (reloadActions) actions.push(...reloadActions);
 				}
 			}
 
-			// 3. Update Token
+			// 2. Did we get real messages? Update the timer.
+			if (actions.length > 0) {
+				this.lastMessageTime = Date.now();
+			}
+
 			const foundToken = traverseJSON(data, (value, key) => {
 				if (key === "continuation" && typeof value === "string") {
 					return value;
@@ -285,13 +289,6 @@ export class YoutubeChatV3 implements DurableObject {
 
 			if (foundToken) {
 				this.nextContinuationToken = foundToken;
-			}
-
-			// 4. Track Staleness
-			if (!hasData) {
-				this.emptyResponseCount++;
-			} else {
-				this.emptyResponseCount = 0; // Reset on success
 			}
 
 			for (const action of actions) {
@@ -305,7 +302,7 @@ export class YoutubeChatV3 implements DurableObject {
 
 		} catch (e: any) {
 			if (e.message === "ForceTimeout" || e.name === 'AbortError') {
-				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Download hung. Resetting..." });
+				// this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Resetting..." });
 			}
 			currentInterval = 5000;
 		} finally {
@@ -340,7 +337,7 @@ export class YoutubeChatV3 implements DurableObject {
 		if (req.headers.get('Upgrade') !== 'websocket') return new Response('Expected a websocket', { status: 400 });
 		const url = new URL(req.url);
 		
-		// Capture Video ID from URL for auto-recovery
+		// Capture Video ID for auto-refresh
 		const parts = url.pathname.split('/');
 		const possibleId = parts[parts.length - 1];
 		if (possibleId && possibleId !== 'ws') this.videoId = possibleId;
