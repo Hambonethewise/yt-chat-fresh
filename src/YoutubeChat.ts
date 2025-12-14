@@ -72,7 +72,7 @@ export class YoutubeChatV3 implements DurableObject {
 
 	private broadcast(data: any) {
 		for (const adapter of this.adapters.values()) {
-			// Sending DEBUG messages to help verify the fix
+			// Debug logs for verification
 			if (data.debug) {
 				for (const socket of adapter.sockets) {
 					try { socket.send(JSON.stringify(data)); } catch (e) {}
@@ -168,9 +168,7 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			);
 
-			// --- THE HARD RESET ---
-			// Race the fetch against a 10s timer. Whoever finishes first wins.
-			// If timer wins, we reject immediately.
+			// --- THE HARD RESET (CONFIRM THIS IS IN YOUR FILE) ---
 			const timeoutPromise = new Promise<Response>((_, reject) => 
 				setTimeout(() => {
 					controller.abort();
@@ -178,6 +176,7 @@ export class YoutubeChatV3 implements DurableObject {
 				}, 10000)
 			);
 
+			// This race guarantees we never wait longer than 10 seconds
 			const res = await Promise.race([fetchPromise, timeoutPromise]);
 
 			if (!res.ok) {
@@ -218,7 +217,7 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			}
 		} catch (e: any) {
-			// LOG THE FIX: If you see this in the console, it means the code saved you.
+			// You will see this log if the fix saves you
 			if (e.message === "ForceTimeout") {
 				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Connection hung. Force resetting..." });
 			}
