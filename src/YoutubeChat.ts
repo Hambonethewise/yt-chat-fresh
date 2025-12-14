@@ -156,7 +156,8 @@ export class YoutubeChatV3 implements DurableObject {
 				currentPlayerState: { playerOffsetMs: "0" }
 			};
 
-			// --- THE FIX: Wrap Fetch + JSON in one Task ---
+			// --- THE FIX: Combine Fetch AND JSON Download into one task ---
+			// This ensures the timer runs until we have the DATA, not just the connection.
 			const fetchDataTask = async () => {
 				const res = await fetch(
 					`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${this.apiKey}`,
@@ -169,21 +170,20 @@ export class YoutubeChatV3 implements DurableObject {
 					}
 				);
 				if (!res.ok) throw new Error(`Status ${res.status}`);
-				// Crucial: We await the JSON *inside* the task so it is covered by the timer
-				return await res.json<any>();
+				return await res.json<any>(); // <--- We wait for this INSIDE the race now
 			};
 
-			const timeoutPromise = new Promise<never>((_, reject) => 
+			const timeoutPromise = new Promise<any>((_, reject) => 
 				setTimeout(() => {
 					controller.abort();
 					reject(new Error("ForceTimeout"));
 				}, 10000)
 			);
 
-			// Race the ENTIRE job against the clock
+			// Race the ENTIRE job (Connect + Download)
 			const data = await Promise.race([fetchDataTask(), timeoutPromise]);
 
-			// If we get here, we have the full data safely.
+			// If we are here, we have the data.
 			
 			let actions: any[] = [];
 			
@@ -219,7 +219,7 @@ export class YoutubeChatV3 implements DurableObject {
 			}
 
 		} catch (e: any) {
-			// Now this catches Download Freezes too!
+			// Now this will catch the download freeze too!
 			if (e.message === "ForceTimeout" || e.name === 'AbortError') {
 				this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Download hung. Resetting..." });
 			}
