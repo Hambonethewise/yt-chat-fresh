@@ -60,7 +60,7 @@ export async function createChatObject(
 	return object.fetch(`http://youtube.chat/ws/${videoId}${url.search}`, forwardedReq);
 }
 
-export class YoutubeChatV3 implements DurableObject {
+export class YoutubeChatV4 implements DurableObject {
 	private adapters: Map<string, AdapterInfo> = new Map();
 	private nextContinuationToken: string | null = null;
 	
