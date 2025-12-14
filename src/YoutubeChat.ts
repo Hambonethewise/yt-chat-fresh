@@ -49,10 +49,11 @@ export class YoutubeChatV3 implements DurableObject {
 	private apiKey!: string;
 	private clientVersion!: string;
 	private visitorData!: string;
-	private seenMessages = new Map<string, number>();
+	// MEMORY FIX: Only store the last 50 IDs.
+	private recentMessageIds = new Set<string>();
 	private isLoopRunning = false; 
 	private nextContinuationToken?: string; 
-	private lastMessageTime = Date.now(); // Tracks the last time we saw a REAL chat message
+	private lastMessageTime = Date.now(); 
 
 	constructor(private state: DurableObjectState, private env: Env) {
 		const r = Router<Request, IHTTPMethods>();
@@ -103,7 +104,6 @@ export class YoutubeChatV3 implements DurableObject {
 	private init: Handler = (req) => {
 		return this.state.blockConcurrencyWhile(async () => {
 			if (this.initialized) {
-				// If reconnecting, update the timestamp so we don't instant-refresh
 				this.lastMessageTime = Date.now(); 
 				try {
 					const data = await req.json<VideoData>();
@@ -151,30 +151,35 @@ export class YoutubeChatV3 implements DurableObject {
 				this.fetchChat();
 			}
 			
-			setInterval(() => this.clearSeenMessages(), 60 * 1000);
 			return new Response();
 		});
 	};
 
-	private async clearSeenMessages() {
-		const cutoff = Date.now() - 1000 * 60;
-		for (const [id, timestamp] of this.seenMessages.entries()) {
-			if (timestamp < cutoff) this.seenMessages.delete(id);
+	// MEMORY FIX: Strict Limit
+	// This function forces the set to never exceed 50 items.
+	private trackMessageId(id: string): boolean {
+		if (this.recentMessageIds.has(id)) return false; // Duplicate
+		
+		this.recentMessageIds.add(id);
+		
+		// If we have too many, delete the oldest (first one in the Set)
+		if (this.recentMessageIds.size > 50) {
+			const oldest = this.recentMessageIds.values().next().value;
+			this.recentMessageIds.delete(oldest);
 		}
+		return true; // New message
 	}
 
-	// --- THE FIX: DEADMAN SWITCH ---
-	// If we haven't seen a real chat message in 30 seconds, we re-scrape the HTML.
-	private async forceRefreshSession() {
-		if (!this.videoId) return; 
-		// this.broadcast({ debug: true, message: "⚠️ [AUTO-REFRESH] No chat for 30s. Resyncing..." });
+	// --- AUTO-HEAL ---
+	private async forceRefreshSession(): Promise<boolean> {
+		if (!this.videoId) return false; 
+		this.broadcast({ debug: true, message: "♻️ [AUTO-HEAL] Stale chat detected. Refreshing token..." });
 		
 		try {
 			const url = `https://www.youtube.com/live_chat?is_popout=1&v=${this.videoId}`;
 			const response = await fetch(url, { headers: COMMON_HEADERS });
 			const text = await response.text();
 			
-			// Robust Regex to find the data in the HTML
 			let json;
 			const match1 = text.match(/window\["ytInitialData"\]\s*=\s*({.+?});/);
 			const match2 = text.match(/var\s+ytInitialData\s*=\s*({.+?});/);
@@ -190,24 +195,31 @@ export class YoutubeChatV3 implements DurableObject {
 					const token = getContinuationToken(continuation);
 					if (token) {
 						this.nextContinuationToken = token;
-						this.lastMessageTime = Date.now(); // Reset the timer
-						// this.broadcast({ debug: true, message: "✅ [AUTO-REFRESH] Resync successful." });
+						this.lastMessageTime = Date.now(); 
+						this.broadcast({ debug: true, message: "✅ [AUTO-HEAL] Success! Resuming chat." });
+						return true;
 					}
 				}
 			}
 		} catch (e) {
-			// Fail silently, we'll try again in the next loop
+			this.broadcast({ debug: true, message: "❌ [AUTO-HEAL] Failed." });
 		}
+		return false;
 	}
 
 	private async fetchChat() {
 		this.isLoopRunning = true; 
 		let currentInterval = BASE_CHAT_INTERVAL;
 
-		// 1. Check Deadman Switch (30 seconds of silence = STALE)
+		// 1. Deadman Switch
 		const timeSinceLastMessage = Date.now() - this.lastMessageTime;
 		if (timeSinceLastMessage > 30000) {
-			await this.forceRefreshSession();
+			const recovered = await this.forceRefreshSession();
+			if (!recovered) {
+				// If recovery failed, DO NOT proceed with old token. Wait and loop.
+				setTimeout(() => this.fetchChat(), 5000);
+				return;
+			}
 		}
 
 		const tokenToUse = this.nextContinuationToken;
@@ -276,7 +288,6 @@ export class YoutubeChatV3 implements DurableObject {
 				}
 			}
 
-			// 2. Did we get real messages? Update the timer.
 			if (actions.length > 0) {
 				this.lastMessageTime = Date.now();
 			}
@@ -294,15 +305,15 @@ export class YoutubeChatV3 implements DurableObject {
 			for (const action of actions) {
 				const id = this.getId(action);
 				if (id) {
-					if (this.seenMessages.has(id)) continue;
-					this.seenMessages.set(id, Date.now());
+					// Use new Strict Memory Tracker
+					if (!this.trackMessageId(id)) continue; 
 				}
 				this.broadcast(action);
 			}
 
 		} catch (e: any) {
 			if (e.message === "ForceTimeout" || e.name === 'AbortError') {
-				// this.broadcast({ debug: true, message: "⚠️ [ANTI-FREEZE] Resetting..." });
+				// Silent retry
 			}
 			currentInterval = 5000;
 		} finally {
@@ -337,7 +348,6 @@ export class YoutubeChatV3 implements DurableObject {
 		if (req.headers.get('Upgrade') !== 'websocket') return new Response('Expected a websocket', { status: 400 });
 		const url = new URL(req.url);
 		
-		// Capture Video ID for auto-refresh
 		const parts = url.pathname.split('/');
 		const possibleId = parts[parts.length - 1];
 		if (possibleId && possibleId !== 'ws') this.videoId = possibleId;
