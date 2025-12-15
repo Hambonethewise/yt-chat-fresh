@@ -20,7 +20,7 @@ type Msg =
 			id: string;
 			author: { id: string; name: string; badges: { tooltip: string; type: string; badge: string }[] };
 			unix: number;
-	  }
+	  }
 	| { debug: true; message: string };
 
 class AdapterInfo {
@@ -202,7 +202,7 @@ export class YoutubeChatV4 implements DurableObject {
 			}
 
 			if (typeof timeoutMs === 'number') return this.clamp(timeoutMs);
-			return YoutubeChatV3.BASE_CHAT_INTERVAL;
+			return YoutubeChatV4.BASE_CHAT_INTERVAL;
 
 		} catch (err: any) {
 			const msg = (err && err.message) ? String(err.message) : String(err);
@@ -247,7 +247,7 @@ export class YoutubeChatV4 implements DurableObject {
 			await this.state.storage.deleteAlarm();
 			return;
 		}
-		const d = Math.max(YoutubeChatV3.MIN_CHAT_INTERVAL, delayMs || YoutubeChatV3.BASE_CHAT_INTERVAL);
+		const d = Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, delayMs || YoutubeChatV4.BASE_CHAT_INTERVAL);
 		await this.state.storage.setAlarm(Date.now() + d);
 	}
 
@@ -299,6 +299,7 @@ export class YoutubeChatV4 implements DurableObject {
 		return new Response('OK');
 	}
 
+	// --- REPLACED handleWebsocket FUNCTION (Starts polling immediately) ---
 	private async handleWebsocket(req: Request): Promise<Response> {
 		const url = new URL(req.url);
 		const parts = url.pathname.split('/');
@@ -311,33 +312,34 @@ export class YoutubeChatV4 implements DurableObject {
 		const socket = server as WebSocket;
 		socket.accept();
 
-		let adapterName: string | null = null;
+		// Adapter is selected via URL query (optional): ?adapter=json
+		// Default to "json" so WebSocket King/Resonite "just works".
+		const adapterName = url.searchParams.get('adapter') || 'json';
 
-		socket.addEventListener('message', (evt: MessageEvent) => {
-			try {
-				const msg = JSON.parse(evt.data as string) as ClientMsg;
-				if (msg.type === 'adapter') {
-					adapterName = msg.adapter || 'default';
-					let adapter = this.adapters.get(adapterName);
-					if (!adapter) { adapter = new AdapterInfo(); this.adapters.set(adapterName, adapter); }
-					adapter.sockets.add(socket);
-					this.broadcast({ debug: true, message: `Adapter registered: ${adapterName}` });
-					// Kickstart the alarm loop
-					void this.scheduleNext(1);
-				}
-			} catch {}
-		});
+		let adapter = this.adapters.get(adapterName);
+		if (!adapter) {
+			adapter = new AdapterInfo();
+			this.adapters.set(adapterName, adapter);
+		}
+		adapter.sockets.add(socket);
 
-		socket.addEventListener('close', () => {
-			if (adapterName) {
-				const adapter = this.adapters.get(adapterName);
-				adapter?.sockets.delete(socket);
-				if (adapter && adapter.sockets.size === 0) this.adapters.delete(adapterName);
-			}
+		// Kickstart polling immediately (no client handshake required)
+		void this.scheduleNext(1_000);
+
+		socket.send(JSON.stringify({ debug: true, message: `Connected. Listening for chat... (adapter=${adapterName})` }));
+
+		const cleanup = () => {
+			const currentAdapter = this.adapters.get(adapterName);
+			currentAdapter?.sockets.delete(socket);
+			if (currentAdapter && currentAdapter.sockets.size === 0) this.adapters.delete(adapterName);
+
 			if (!this.hasActiveSockets()) void this.state.storage.deleteAlarm();
-		});
+		};
 
-		socket.send(JSON.stringify({ debug: true, message: 'Connected. Listening for chat...' }));
+		// The new code ignores any incoming messages (no dynamic adapter switching)
+		socket.addEventListener('close', cleanup);
+		socket.addEventListener('error', cleanup);
+
 		return new Response(null, { status: 101, webSocket: client as any });
 	}
 
@@ -378,7 +380,7 @@ export class YoutubeChatV4 implements DurableObject {
 		return traverseJSON(obj, (v, k) => k === 'continuation' && typeof v === 'string' ? v : undefined) || null;
 	}
 
-	private clamp(ms: number) { return Math.max(YoutubeChatV3.MIN_CHAT_INTERVAL, Math.min(YoutubeChatV3.MAX_CHAT_INTERVAL, ms)); }
+	private clamp(ms: number) { return Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, Math.min(YoutubeChatV4.MAX_CHAT_INTERVAL, ms)); }
 	private hasActiveSockets() { for (const a of this.adapters.values()) { if (a.sockets.size > 0) return true; } return false; }
 	
 	private broadcast(msg: Msg) {
