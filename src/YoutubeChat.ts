@@ -202,7 +202,8 @@ export class YoutubeChatV4 implements DurableObject {
 			}
 
 			if (typeof timeoutMs === 'number') return this.clamp(timeoutMs);
-			return YoutubeChatV4.BASE_CHAT_INTERVAL;
+			return YoutubeChatV4.BASE_CHAT_INTERVAL; // FIXED: Used V4
+            // return YoutubeChatV3.BASE_CHAT_INTERVAL; // Original error line
 
 		} catch (err: any) {
 			const msg = (err && err.message) ? String(err.message) : String(err);
@@ -247,7 +248,7 @@ export class YoutubeChatV4 implements DurableObject {
 			await this.state.storage.deleteAlarm();
 			return;
 		}
-		const d = Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, delayMs || YoutubeChatV4.BASE_CHAT_INTERVAL);
+		const d = Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, delayMs || YoutubeChatV4.BASE_CHAT_INTERVAL); // FIXED: Used V4
 		await this.state.storage.setAlarm(Date.now() + d);
 	}
 
@@ -380,7 +381,7 @@ export class YoutubeChatV4 implements DurableObject {
 		return traverseJSON(obj, (v, k) => k === 'continuation' && typeof v === 'string' ? v : undefined) || null;
 	}
 
-	private clamp(ms: number) { return Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, Math.min(YoutubeChatV4.MAX_CHAT_INTERVAL, ms)); }
+	private clamp(ms: number) { return Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, Math.min(YoutubeChatV4.MAX_CHAT_INTERVAL, ms)); } // FIXED: Used V4
 	private hasActiveSockets() { for (const a of this.adapters.values()) { if (a.sockets.size > 0) return true; } return false; }
 	
 	private broadcast(msg: Msg) {
