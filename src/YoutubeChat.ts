@@ -20,11 +20,15 @@ type Msg =
 			id: string;
 			author: { id: string; name: string; badges: { tooltip: string; type: string; badge: string }[] };
 			unix: number;
-	  }
+	  }
 	| { debug: true; message: string };
 
+// --- MODIFIED ADAPTER INFO (With Outbox Queue) ---
 class AdapterInfo {
 	sockets: Set<WebSocket> = new Set();
+	// Queue outbound messages so bursts don't get dropped by Resonite
+	outbox: string[] = [];
+	draining = false;
 }
 
 // --- Main Worker Logic ---
@@ -88,6 +92,10 @@ export class YoutubeChatV4 implements DurableObject {
 	private static readonly MIN_CHAT_INTERVAL = 1_000;
 	private static readonly MAX_CHAT_INTERVAL = 20_000;
 
+	// --- THROTTLING CONSTANTS (The Fix) ---
+	private static readonly OUTBOUND_INTERVAL_MS = 100; // Send 1 message every 100ms
+	private static readonly OUTBOX_MAX = 500;           // Prevents memory leaks if queue gets too big
+
 	constructor(private state: DurableObjectState, private env: Env) {
 		// Keep sockets alive with pings
 		setInterval(() => this.sendPing(), 30_000);
@@ -102,7 +110,7 @@ export class YoutubeChatV4 implements DurableObject {
 		return r.handle(req);
 	}
 
-	// --- ALARM HANDLER (Runs in a fresh invocation = Reset Subrequest Limit) ---
+	// --- ALARM HANDLER ---
 	async alarm(): Promise<void> {
 		await this.state.blockConcurrencyWhile(async () => {
 			const delay = await this.pollOnce();
@@ -113,24 +121,21 @@ export class YoutubeChatV4 implements DurableObject {
 	// --- POLLING LOGIC ---
 	private async pollOnce(): Promise<number> {
 		if (!this.initialized || !this.nextContinuationToken) return 2_000;
-		if (!this.hasActiveSockets()) return 0; // Stop polling if no listeners
+		if (!this.hasActiveSockets()) return 0;
 
 		const now = Date.now();
 		const msSinceOk = now - this.lastOkFetchTime;
 
-		// DEADMAN SWITCH: Check if we are stale
+		// DEADMAN SWITCH
 		if (msSinceOk > 45_000 && now >= this.nextHealAllowedAt) {
 			this.broadcast({ debug: true, message: '♻️ [AUTO-HEAL] Refreshing token...' });
-
 			const recovered = await this.forceRefreshSession();
 			if (!recovered) {
-				this.broadcast({ debug: true, message: '⚠️ [AUTO-HEAL] Token refresh failed.' });
-				this.healBackoffMs = Math.min(this.healBackoffMs * 2, 60_000); // Exponential backoff
+				this.broadcast({ debug: true, message: '⚠️ [AUTO-HEAL] Failed.' });
+				this.healBackoffMs = Math.min(this.healBackoffMs * 2, 60_000);
 				this.nextHealAllowedAt = now + this.healBackoffMs;
 				return this.healBackoffMs;
 			}
-
-			// Success! Reset backoff
 			this.healBackoffMs = 5_000;
 			this.nextHealAllowedAt = now + 5_000;
 		}
@@ -140,9 +145,7 @@ export class YoutubeChatV4 implements DurableObject {
 		const timeoutId = setTimeout(() => controller.abort(), 10_000);
 
 		try {
-			// Fetch from YouTube (Using SCRAPED API Key, not ENV)
 			const url = `https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${this.apiKey}`;
-
 			const res = await fetch(url, {
 				method: 'POST',
 				headers: COMMON_HEADERS,
@@ -150,7 +153,7 @@ export class YoutubeChatV4 implements DurableObject {
 					context: {
 						client: {
 							clientName: 'WEB',
-							clientVersion: this.clientVersion, // Use scraped version
+							clientVersion: this.clientVersion,
 							hl: 'en',
 							gl: 'US',
 							visitorData: this.visitorData,
@@ -169,16 +172,14 @@ export class YoutubeChatV4 implements DurableObject {
 			if (!res.ok) throw new Error(`Status ${res.status}`);
 
 			const data = await res.json<any>();
-			this.lastOkFetchTime = Date.now(); // Mark success
+			this.lastOkFetchTime = Date.now();
 
 			const { token: nextToken, timeoutMs } = this.extractContinuationAndTimeout(data);
 			if (nextToken) this.nextContinuationToken = nextToken;
 
 			const actions = data?.continuationContents?.liveChatContinuation?.actions ?? [];
 			
-			// Process Messages
 			for (const action of actions) {
-				// Time Barrier
 				let msgTimestamp = 0;
 				try {
 					const renderer =
@@ -197,18 +198,16 @@ export class YoutubeChatV4 implements DurableObject {
 					if (!this.trackMessageId(id)) continue;
 				}
 				
-				// Transform and Broadcast
 				this.processAndBroadcast(action, id);
 			}
 
 			if (typeof timeoutMs === 'number') return this.clamp(timeoutMs);
-			return YoutubeChatV4.BASE_CHAT_INTERVAL; // FIXED: Used V4
-            // return YoutubeChatV3.BASE_CHAT_INTERVAL; // Original error line
+			return YoutubeChatV4.BASE_CHAT_INTERVAL;
 
 		} catch (err: any) {
 			const msg = (err && err.message) ? String(err.message) : String(err);
 			if (msg.includes('Too many subrequests')) {
-				this.broadcast({ debug: true, message: '⚠️ [FETCH] Subrequest limit hit (Alarm will reset).' });
+				this.broadcast({ debug: true, message: '⚠️ [FETCH] Subrequest limit hit.' });
 				return 5_000;
 			}
 			this.broadcast({ debug: true, message: `⚠️ [FETCH] ${msg}` });
@@ -218,10 +217,59 @@ export class YoutubeChatV4 implements DurableObject {
 		}
 	}
 
-	// --- HELPER METHODS ---
+	// --- NEW BROADCAST SYSTEM (Queued) ---
+
+	private broadcast(msg: Msg) {
+		const text = JSON.stringify(msg);
+
+		// Never delay pings (send immediately)
+		if ((msg as any)?.type === 'ping') {
+			this.adapters.forEach((adapter) => {
+				adapter.sockets.forEach((socket) => this.safeSend(socket, text));
+			});
+			return;
+		}
+
+		// Queue everything else
+		this.adapters.forEach((adapter) => this.enqueue(adapter, text));
+	}
+
+	private enqueue(adapter: AdapterInfo, payload: string) {
+		adapter.outbox.push(payload);
+
+		// Cap memory usage
+		if (adapter.outbox.length > YoutubeChatV4.OUTBOX_MAX) {
+			adapter.outbox.splice(0, adapter.outbox.length - YoutubeChatV4.OUTBOX_MAX);
+		}
+
+		if (!adapter.draining) {
+			adapter.draining = true;
+			this.drain(adapter);
+		}
+	}
+
+	private drain(adapter: AdapterInfo) {
+		if (adapter.sockets.size === 0) {
+			adapter.outbox.length = 0;
+			adapter.draining = false;
+			return;
+		}
+
+		const next = adapter.outbox.shift();
+		if (!next) {
+			adapter.draining = false;
+			return;
+		}
+
+		adapter.sockets.forEach((socket) => this.safeSend(socket, next));
+
+		// Send next message after 100ms
+		setTimeout(() => this.drain(adapter), YoutubeChatV4.OUTBOUND_INTERVAL_MS);
+	}
+
+	// --- HELPERS ---
 
 	private processAndBroadcast(action: any, id: string | undefined) {
-		// Basic Text Message
 		if (action.addChatItemAction?.item?.liveChatTextMessageRenderer) {
 			const renderer = action.addChatItemAction.item.liveChatTextMessageRenderer;
 			const message = renderer.message?.runs?.map((r: any) => r.text).join('') || "";
@@ -248,7 +296,7 @@ export class YoutubeChatV4 implements DurableObject {
 			await this.state.storage.deleteAlarm();
 			return;
 		}
-		const d = Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, delayMs || YoutubeChatV4.BASE_CHAT_INTERVAL); // FIXED: Used V4
+		const d = Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, delayMs || YoutubeChatV4.BASE_CHAT_INTERVAL);
 		await this.state.storage.setAlarm(Date.now() + d);
 	}
 
@@ -271,7 +319,7 @@ export class YoutubeChatV4 implements DurableObject {
 
 			this.nextContinuationToken = token;
 			this.lastOkFetchTime = Date.now();
-			this.bootTime = Date.now(); // Reset time barrier
+			this.bootTime = Date.now();
 			return true;
 		} catch {
 			return false;
@@ -300,7 +348,6 @@ export class YoutubeChatV4 implements DurableObject {
 		return new Response('OK');
 	}
 
-	// --- REPLACED handleWebsocket FUNCTION (Starts polling immediately) ---
 	private async handleWebsocket(req: Request): Promise<Response> {
 		const url = new URL(req.url);
 		const parts = url.pathname.split('/');
@@ -313,8 +360,6 @@ export class YoutubeChatV4 implements DurableObject {
 		const socket = server as WebSocket;
 		socket.accept();
 
-		// Adapter is selected via URL query (optional): ?adapter=json
-		// Default to "json" so WebSocket King/Resonite "just works".
 		const adapterName = url.searchParams.get('adapter') || 'json';
 
 		let adapter = this.adapters.get(adapterName);
@@ -324,20 +369,23 @@ export class YoutubeChatV4 implements DurableObject {
 		}
 		adapter.sockets.add(socket);
 
-		// Kickstart polling immediately (no client handshake required)
 		void this.scheduleNext(1_000);
 
 		socket.send(JSON.stringify({ debug: true, message: `Connected. Listening for chat... (adapter=${adapterName})` }));
 
 		const cleanup = () => {
 			const currentAdapter = this.adapters.get(adapterName);
-			currentAdapter?.sockets.delete(socket);
-			if (currentAdapter && currentAdapter.sockets.size === 0) this.adapters.delete(adapterName);
-
+			if (currentAdapter) {
+				currentAdapter.sockets.delete(socket);
+				if (currentAdapter.sockets.size === 0) {
+					currentAdapter.outbox.length = 0; // Clear queue
+					currentAdapter.draining = false;
+					this.adapters.delete(adapterName);
+				}
+			}
 			if (!this.hasActiveSockets()) void this.state.storage.deleteAlarm();
 		};
 
-		// The new code ignores any incoming messages (no dynamic adapter switching)
 		socket.addEventListener('close', cleanup);
 		socket.addEventListener('error', cleanup);
 
@@ -377,17 +425,12 @@ export class YoutubeChatV4 implements DurableObject {
 	}
 
 	private traverseJSONForContinuation(obj: any): string | null {
-		// Helper used by extractContinuation fallback
 		return traverseJSON(obj, (v, k) => k === 'continuation' && typeof v === 'string' ? v : undefined) || null;
 	}
 
-	private clamp(ms: number) { return Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, Math.min(YoutubeChatV4.MAX_CHAT_INTERVAL, ms)); } // FIXED: Used V4
+	private clamp(ms: number) { return Math.max(YoutubeChatV4.MIN_CHAT_INTERVAL, Math.min(YoutubeChatV4.MAX_CHAT_INTERVAL, ms)); }
 	private hasActiveSockets() { for (const a of this.adapters.values()) { if (a.sockets.size > 0) return true; } return false; }
 	
-	private broadcast(msg: Msg) {
-		const text = JSON.stringify(msg);
-		this.adapters.forEach(adapter => adapter.sockets.forEach(sock => this.safeSend(sock, text)));
-	}
 	private safeSend(socket: WebSocket, data: string) { try { socket.send(data); } catch { try { socket.close(); } catch {} } }
 	private sendPing() { if (!this.hasActiveSockets()) return; this.broadcast({ type: 'ping' }); }
 }
